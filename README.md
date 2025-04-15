@@ -6,6 +6,9 @@ Functionality
 - 🔥 Compatible and linked with @outerbase to easily explore the state of the DO or DOs
 - 🔥 query fn promises json/ok directly from the worker. This makes working with it a lot simpler.
 
+> [!IMPORTANT]
+> New (more opinionated) version at [janwilmake/dorm](https://github.com/janwilmake/dorm)
+
 # Demo
 
 See https://ormdo.wilmake.com for the `example.ts` example, which demonstrates it works using a users management API and HTML for that.
