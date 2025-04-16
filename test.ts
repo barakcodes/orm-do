@@ -214,8 +214,9 @@ export const handlePost = async (
       const userId = body.id || crypto.randomUUID();
       const createdAt = new Date().toISOString();
 
+     const user = await db.transaction().execute(async (trx) => {
       // Insert the user
-      const user = await db
+      const user = await trx
         .insertInto("users")
         .values({
           id: userId,
@@ -224,12 +225,35 @@ export const handlePost = async (
           created_at: createdAt,
         })
         .returning(["id", "name", "email", "created_at"])
-        .executeTakeFirstOrThrow();
+        .executeTakeFirst();
+        console.log("__user", user)
 
+        await trx.updateTable("users")
+        .set({
+          name: `${user?.name}-123`
+        })
+        .where("id", "=", userId)
+        .execute();
+
+        return user
+      });
+
+    // const user = await db
+    // .insertInto("users")
+    // .values({
+    //   id: userId,
+    //   name: body.name,
+    //   email: body.email,
+    //   created_at: createdAt,
+    // })
+    // .returning(["id", "name", "email", "created_at"])
+    // .executeTakeFirst();
+    console.log("__user", user)
       return new Response(JSON.stringify(user), {
         status: 201,
         headers: corsHeaders,
       });
+    
     } catch (error) {
       // Check for unique constraint violation (email already exists)
       const errorMsg = (error as Error).message || "";

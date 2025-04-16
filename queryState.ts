@@ -1,6 +1,9 @@
 /// <reference types="@cloudflare/workers-types" />
 //@ts-check
 
+// Remove direct import as Transaction should be global via reference
+// import type { SqlStorage, SqlStorageTransaction, SqlStorageCursor } from "@cloudflare/workers-types";
+
 // Basic configuration for the factory
 export interface DBConfig {
   version?: string; // Version prefix for DO naming
@@ -17,16 +20,17 @@ export interface MiddlewareOptions {
 // Query options for individual queries
 interface QueryOptions {
   isRaw?: boolean;
-  isTransaction?: boolean;
+  isTransaction?: boolean; // Re-added for internal batching
 }
 
 // Define specific return types based on raw vs regular format
-type RawQueryResult = {
+export type RawQueryResult = {
   columns: string[];
   rows: any[][];
   meta: {
     rows_read: number;
     rows_written: number;
+    // last_insert_rowid?: number | bigint; // Potentially add later
   };
 };
 
@@ -64,7 +68,7 @@ export function createDBClient<T extends DBConfig>(
   doNamespace: DurableObjectNamespace,
   config: T,
   name?: string,
-) {
+): DBClient { // Return the specific DBClient type
   const nameWithVersion = getNameWithVersion(name, config.version);
   const id = doNamespace.idFromName(nameWithVersion);
   const obj = doNamespace.get(id);
@@ -75,126 +79,136 @@ export function createDBClient<T extends DBConfig>(
     ? config.schema
     : [config.schema];
 
-  // The query function returned by the factory
-  async function query<O extends QueryOptions>(
-    options: O,
-    sql: string,
-    ...params: any[]
-  ): Promise<QueryResult<QueryResponseType<O>>> {
-    try {
-      // Initialize if not already done
-      if (!initialized) {
-        const initResponse = await obj.fetch("https://dummy-url/init", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            schema: schemaStatements,
-          }),
-        });
-
-        if (!initResponse.ok) {
-          return {
-            json: null,
-            status: initResponse.status,
-            ok: false,
-          };
-        }
-
-        initialized = true;
-      }
-
-      // Format the request based on whether we want a transaction or a single query
-      const body = options.isTransaction
-        ? JSON.stringify({
-            transaction: [{ sql, params }],
-          })
-        : JSON.stringify({
-            sql,
-            params,
-            isRaw: options.isRaw,
-          });
-
-      // Determine the appropriate endpoint based on format
-      const endpoint = options.isRaw ? "/query/raw" : "/query";
-
-      const response = await obj.fetch(`https://dummy-url${endpoint}`, {
-        method: "POST",
+  // --- Internal Helper to Send Requests to DO ---
+  async function sendToDoRequest<R = any>(path: string, body: any, method: string = 'POST'): Promise<QueryResult<R>> {
+      const response = await obj.fetch(`https://dummy-url${path}`, {
+        method: method,
         headers: {
           "Content-Type": "application/json",
         },
-        body,
+        body: JSON.stringify(body),
       });
 
-      if (!response.ok) {
-        return {
-          json: null,
-          status: response.status,
-          ok: false,
-        };
+      let responseJson: R | null = null;
+      if (response.ok && response.status !== 204) {
+          try {
+              responseJson = await response.json() as R;
+          } catch (e) {
+              console.warn(`Failed to parse JSON response from ${path} (status ${response.status}):`, e);
+          }
+      } else if (!response.ok) {
+           try {
+               const errorBody = await response.text();
+               console.error(`DO request failed for ${path} (status ${response.status}): ${errorBody}`);
+           } catch (e) {
+                console.error(`DO request failed for ${path} (status ${response.status}), failed to read error body.`);
+           }
       }
 
-      const responseData: any = await response.json();
-
-      // If using browsable's raw format, the result should be in responseData.result
-      const result =
-        options.isRaw && responseData.result
-          ? responseData.result
-          : responseData;
-
       return {
-        json: result as QueryResponseType<O>,
+        json: responseJson,
         status: response.status,
-        ok: true,
+        ok: response.ok,
       };
-    } catch (error) {
-      console.error(`Error querying state: ${error}`);
-      return {
-        json: null,
-        status: 500,
-        ok: false,
-      };
+  }
+
+  // --- Initialization Logic ---
+  async function ensureInitialized(): Promise<boolean> {
+    if (initialized) return true;
+    console.log("Attempting DB Initialization...");
+    const initResponse = await sendToDoRequest('/init', { schema: schemaStatements });
+    if (!initResponse.ok) {
+      console.error("Initialization failed:", initResponse.status);
+      return false;
     }
+    console.log("DB Initialized successfully.");
+    initialized = true;
+    return true;
   }
 
-  // Convenience wrapper for standard queries
-  async function standardQuery<T = Record<string, any>>(
+  // --- Core Query Function (Handles single queries and transaction batches) ---
+  async function query<O extends QueryOptions>(
+    options: O,
+    // Can be SQL string or the transaction batch array
+    sqlOrTransaction: string | { sql: string; params?: any[] }[], 
+    params: any[] = [], // Only used when sqlOrTransaction is string
+  ): Promise<QueryResult<QueryResponseType<O>>> {
+    if (!await ensureInitialized()) {
+       throw new Error("Database initialization failed. Cannot proceed.");
+    }
+
+    let body: any;
+    let endpoint: string;
+
+    if (options.isTransaction && Array.isArray(sqlOrTransaction)) {
+      // Transaction Batch (from Kysely commit)
+      body = { transaction: sqlOrTransaction };
+      // Batched transactions MUST go to the raw endpoint
+      endpoint = "/query/raw"; 
+    } else if (typeof sqlOrTransaction === 'string') {
+      // Single Query
+      body = {
+        sql: sqlOrTransaction,
+        params: params,
+      };
+      // Determine endpoint based on whether raw results are requested
+      endpoint = options.isRaw ? "/query/raw" : "/query";
+    } else {
+      throw new Error('Invalid arguments provided to internal query function.');
+    }
+
+    const result = await sendToDoRequest<QueryResponseType<O>>(endpoint, body);
+
+    // If the DO returns results within a { result: ... } structure (like /query/raw did),
+    // extract the actual result. Otherwise, return the direct JSON.
+    // Adjust this based on the actual DO response format for consistency.
+    if (options.isRaw && result.json && typeof result.json === 'object' && 'result' in result.json) {
+        return {
+            ...result,
+            // @ts-ignore
+            json: result.json.result as QueryResponseType<O> 
+        };
+    }
+
+    return result;
+  }
+
+  // --- Public Client Methods ---
+
+  async function standardQuery<TRes = Record<string, any>>(
     sql: string,
-    ...params: any[]
-  ): Promise<QueryResult<ArrayQueryResult<T>>> {
-    return query(
-      { isRaw: false, isTransaction: false },
-      sql,
-      ...params,
-    ) as Promise<QueryResult<ArrayQueryResult<T>>>;
+    params?: any[],
+  ): Promise<QueryResult<ArrayQueryResult<TRes>>> {
+    return query<QueryOptions & { isRaw: false }>(
+      { isRaw: false, isTransaction: false }, sql, params
+    ) as Promise<QueryResult<ArrayQueryResult<TRes>>>;
   }
 
-  // Convenience wrapper for raw queries
   async function rawQuery(
     sql: string,
-    ...params: any[]
+    params?: any[],
   ): Promise<QueryResult<RawQueryResult>> {
-    return query(
-      { isRaw: true, isTransaction: false },
-      sql,
-      ...params,
-    ) as Promise<QueryResult<RawQueryResult>>;
+    return query<QueryOptions & { isRaw: true }>(
+      { isRaw: true, isTransaction: false }, sql, params
+    );
   }
 
-  // Convenience wrapper for transaction queries
-  async function transactionQuery<T = Record<string, any>>(
-    sql: string,
-    ...params: any[]
-  ): Promise<QueryResult<ArrayQueryResult<T>>> {
-    return query(
-      { isRaw: false, isTransaction: true },
-      sql,
-      ...params,
-    ) as Promise<QueryResult<ArrayQueryResult<T>>>;
+  // Reintroduce transactionQuery for batching from Kysely commit
+  async function transactionQuery<TRes = Record<string, any>>(
+      transaction: { sql: string; params?: any[] }[],
+  ): Promise<QueryResult<RawQueryResult>> { 
+      // Send the batch. isRaw needs to be true because the DO endpoint is /query/raw
+      // isTransaction needs to be true to trigger the batch format in `query`
+      // The actual result type (ArrayQueryResult) depends on the DO's response for batches.
+      // Assuming /query/raw with a batch returns results compatible with ArrayQueryResult.
+      // If it returns multiple RawQueryResult, this cast needs adjustment.
+      return query<QueryOptions & { isRaw: true, isTransaction: true }>(
+          { isRaw: true, isTransaction: true }, 
+          transaction // Pass the batch array
+      );
   }
-
-  // Middleware function to handle HTTP requests
+  
+  // --- Middleware Function (Largely unchanged) ---
   async function middleware(
     request: Request,
     options: MiddlewareOptions = {},
@@ -202,394 +216,219 @@ export function createDBClient<T extends DBConfig>(
     const url = new URL(request.url);
     const prefix = options.prefix || "/db";
 
-    // Check if the request path starts with the prefix
     if (!url.pathname.startsWith(prefix)) {
-      return undefined; // Not handled by this middleware
+      return undefined;
     }
 
-    // Handle CORS preflight request
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: getCorsHeaders(),
-      });
+      return new Response(null, { status: 204, headers: getCorsHeaders() });
     }
 
-    // Check authentication if a secret is provided
     if (options.secret) {
       const authHeader = request.headers.get("Authorization");
       const expectedHeader = `Bearer ${options.secret}`;
-
       if (!authHeader || authHeader !== expectedHeader) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
-          status: 401,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
+          status: 401, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
         });
       }
     }
 
-    // Extract the sub-path
     const subPath = url.pathname.substring(prefix.length);
 
-    // Initialize the database if needed
     if (subPath === "/init" && request.method === "POST") {
-      // Initialize if not already done
-      if (!initialized) {
-        const initResponse = await obj.fetch("https://dummy-url/init", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            schema: schemaStatements,
-          }),
-        });
-
-        if (!initResponse.ok) {
-          return new Response(
-            JSON.stringify({ error: "Initialization failed" }),
-            {
-              status: initResponse.status,
-              headers: {
-                ...getCorsHeaders(),
-                "Content-Type": "application/json",
-              },
-            },
-          );
-        }
-
-        initialized = true;
-        return new Response(JSON.stringify({ initialized: true }), {
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
-        });
-      }
+       if (!await ensureInitialized()) {
+         return new Response(JSON.stringify({ error: "Initialization failed" }), {
+            status: 500, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
+         });
+       }
+       return new Response(JSON.stringify({ initialized: true }), {
+            headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
+       });
     }
 
-    // Handle raw SQL query
-    if (subPath === "/query/raw" && request.method === "POST") {
+    if ((subPath === "/query" || subPath === "/query/raw") && request.method === "POST") {
       try {
-        const data = (await request.json()) as any;
-        let result;
-
-        // Handle transaction if present
-        if (data.transaction) {
-          const queryOptions: QueryOptions = {
-            isRaw: true,
-            isTransaction: true,
-          };
-          const result = await query(
-            queryOptions,
-            data.transaction[0].sql,
-            ...(data.transaction[0].params || []),
-          );
-
-          return new Response(JSON.stringify({ result: result.json }), {
-            status: result.status,
-            headers: {
-              ...getCorsHeaders(),
-              "Content-Type": "application/json",
-            },
-          });
-        } else {
-          // Single query
-          const queryOptions: QueryOptions = {
-            isRaw: true,
-            isTransaction: false,
-          };
-          const result = await query(
-            queryOptions,
-            data.sql,
-            ...(data.params || []),
-          );
-
-          return new Response(JSON.stringify({ result: result.json }), {
-            status: result.status,
-            headers: {
-              ...getCorsHeaders(),
-              "Content-Type": "application/json",
-            },
-          });
+        const body = await request.json() as { sql: string; params?: any[] }; 
+        if (!body.sql) {
+             return new Response(JSON.stringify({ error: "Missing 'sql' property in request body" }), {
+                status: 400, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
+             });
         }
-      } catch (error: any) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
-        });
-      }
-    }
-
-    // Handle SQL query
-    if (subPath === "/query" && request.method === "POST") {
-      try {
-        const data = (await request.json()) as {
-          sql: string;
-          params?: any[];
-          isRaw?: boolean;
-          isTransaction?: boolean;
-        };
-
-        if (!data.sql) {
-          return new Response(JSON.stringify({ error: "Missing SQL query" }), {
-            status: 400,
-            headers: {
-              ...getCorsHeaders(),
-              "Content-Type": "application/json",
-            },
-          });
-        }
-
-        const queryOptions: QueryOptions = {
-          isRaw: data.isRaw || false,
-          isTransaction: data.isTransaction || false,
-        };
-
-        const result = await query(
-          queryOptions,
-          data.sql,
-          ...(data.params || []),
-        );
+        // Middleware executes queries outside transactions
+        const queryOptions: QueryOptions = { isRaw: subPath === "/query/raw", isTransaction: false };
+        const result = await query(queryOptions, body.sql, body.params);
 
         return new Response(JSON.stringify(result.json), {
-          status: result.status,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
+          status: result.status, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
         });
       } catch (error: any) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
+        return new Response(JSON.stringify({ error: error.message || "Query processing error" }), {
+          status: 500, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
         });
       }
     }
 
-    // If we get here, the path wasn't recognized
     return new Response(JSON.stringify({ error: "Not found" }), {
-      status: 404,
-      headers: {
-        ...getCorsHeaders(),
-        "Content-Type": "application/json",
-      },
+      status: 404, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
     });
   }
 
+  // Return the client object conforming to DBClient type
   return {
-    query,
     standardQuery,
     rawQuery,
-    transactionQuery,
+    transactionQuery, // Expose batch query method
     middleware,
   };
 }
 
+// Updated DBClient type definition
 export type DBClient = {
-  query: <O extends QueryOptions>(
-    options: O,
-    sql: string,
-    ...params: any[]
-  ) => Promise<QueryResult<QueryResponseType<O>>>;
   standardQuery: <T = Record<string, any>>(
     sql: string,
-    ...params: any[]
+    params?: any[],
   ) => Promise<QueryResult<ArrayQueryResult<T>>>;
   rawQuery: (
     sql: string,
-    ...params: any[]
+    params?: any[],
   ) => Promise<QueryResult<RawQueryResult>>;
-  transactionQuery: <T = Record<string, any>>(
-    sql: string,
-    ...params: any[]
-  ) => Promise<QueryResult<ArrayQueryResult<T>>>;
+  // Transaction query sends batch and returns RawQueryResult (of last statement)
+  transactionQuery: (
+      transaction: { sql: string; params?: any[] }[],
+  ) => Promise<QueryResult<RawQueryResult>>;
   middleware: (
     request: Request,
     options?: MiddlewareOptions,
   ) => Promise<Response | undefined>;
 };
 
-// Durable Object implementation with Browsable compatibility
+// Durable Object implementation 
 export class ORMDO {
   private state: DurableObjectState;
-  public sql: SqlStorage; // Public for Browsable compatibility
+  public sql: SqlStorage; 
   private initialized: boolean = false;
 
-  // CORS headers for responses
   private corsHeaders = getCorsHeaders();
 
   constructor(state: DurableObjectState) {
     this.state = state;
     this.sql = state.storage.sql;
+    this.state.storage.get("initialized_at").then(val => { this.initialized = !!val; });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Handle CORS preflight request
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: this.corsHeaders,
-      });
+      return new Response(null, { status: 204, headers: this.corsHeaders });
     }
 
-    // Handle schema initialization
-    if (path === "/init" && request.method === "POST") {
-      try {
-        const { schema } = (await request.json()) as {
-          schema: string[];
-        };
-
-        // Create schema_info table if not exists
-        this.sql.exec(`
-          CREATE TABLE IF NOT EXISTS schema_info (
-            key TEXT PRIMARY KEY,
-            value TEXT
-          )
-        `);
-
-        // Execute all schema statements
-        for (const statement of schema) {
-          this.sql.exec(statement);
-        }
-
-        // Update initialization timestamp
-        const timestamp = new Date().toISOString();
-        this.sql.exec(
-          "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('initialized_at', ?)",
-          timestamp,
-        );
-
-        this.initialized = true;
-
-        return new Response(JSON.stringify({ initialized_at: timestamp }), {
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
+    try {
+      // Initialization endpoint
+      if (path === "/init" && request.method === "POST") {
+        const { schema } = (await request.json()) as { schema: string[] };
+        
+        // Use storage.transaction for initialization to ensure atomicity
+        await this.state.storage.transaction(async () => { 
+            await this.sql.exec(`
+              CREATE TABLE IF NOT EXISTS schema_info (
+                key TEXT PRIMARY KEY,
+                value TEXT
+              )
+            `); 
+            for (const statement of schema) {
+              await this.sql.exec(statement);
+            }
+            const timestamp = new Date().toISOString();
+            await this.sql.exec(
+              "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('initialized_at', ?)",
+              [timestamp],
+            );
+            this.initialized = true;
+            console.log("Schema initialized via transaction at:", timestamp);
         });
-      } catch (error: any) {
-        console.error("Schema initialization error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
+
+        return new Response(JSON.stringify({ initialized_at: new Date().toISOString() }), { 
+          headers: { ...this.corsHeaders, "Content-Type": "application/json" },
         });
       }
-    }
-
-    // Standard query endpoint
-    if (path === "/query" && request.method === "POST") {
-      try {
+      
+      // Standard query endpoint
+      if (path === "/query" && request.method === "POST") {
         const {
           sql,
           params = [],
-          isRaw = false,
-        } = (await request.json()) as {
-          sql: string;
-          params?: any[];
-          isRaw?: boolean;
-        };
-
-        // Execute the query
-        const cursor = this.sql.exec(sql, ...params);
-
-        // Return the appropriate format
-        const result = isRaw
-          ? {
-              rows: Array.from(cursor.raw()),
-              columns: cursor.columnNames,
-              meta: {
-                rows_read: cursor.rowsRead,
-                rows_written: cursor.rowsWritten,
-              },
-            }
-          : cursor.toArray();
+        } = (await request.json()) as { sql: string; params?: any[]; };
+        
+        const cursor = await this.sql.exec(sql, ...params);
+        const result = await cursor.toArray(); 
 
         return new Response(JSON.stringify(result), {
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
-      } catch (error: any) {
-        console.error("SQL execution error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
+          headers: { ...this.corsHeaders, "Content-Type": "application/json" },
         });
       }
-    }
 
-    // Raw query endpoint (Browsable compatible)
-    if (path === "/query/raw" && request.method === "POST") {
-      try {
-        const data = (await request.json()) as any;
-        let result;
+      // Raw query endpoint (Handles single raw queries AND transaction batches)
+      if (path === "/query/raw" && request.method === "POST") {
+        const data = (await request.json()) as {
+          sql?: string;
+          params?: any[];
+          transaction?: { sql: string; params?: any[] }[];
+        };
 
-        // Handle transaction if present
+        let finalResult: RawQueryResult;
+
         if (data.transaction) {
+          // Handle transaction batch using storage.transaction()
           const results: RawQueryResult[] = [];
-          for (const query of data.transaction) {
-            const cursor = this.sql.exec(query.sql, ...(query.params || []));
-            results.push({
-              columns: cursor.columnNames,
-              rows: Array.from(cursor.raw()),
-              meta: {
-                rows_read: cursor.rowsRead,
-                rows_written: cursor.rowsWritten,
-              },
-            });
-          }
-          result = results;
-        } else {
-          // Single query
-          const cursor = this.sql.exec(data.sql, ...(data.params || []));
-          result = {
+          await this.state.storage.transaction(async () => { 
+              for (const query of data.transaction!) { 
+                  const cursor = await this.sql.exec(query.sql, ...(query.params || []));
+                  results.push({
+                      columns: cursor.columnNames,
+                      rows: Array.from(await cursor.raw()), // Convert Iterator to Array
+                      meta: {
+                          rows_read: cursor.rowsRead,
+                          rows_written: cursor.rowsWritten,
+                      },
+                  });
+              }
+          });
+          // Return the result of the last statement in the batch
+          finalResult = results.length > 0 ? results[results.length - 1] : { columns: [], rows: [], meta: { rows_read: 0, rows_written: 0 } };
+          finalResult.rows = []; // Kysely expects empty rows from buffered transaction executeQuery
+        
+        } else if (data.sql) {
+          // Handle single raw query
+          const cursor = await this.sql.exec(data.sql, ...(data.params || []));
+          finalResult = {
             columns: cursor.columnNames,
-            rows: Array.from(cursor.raw()),
+            rows: Array.from(await cursor.raw()), // Convert Iterator to Array
             meta: {
               rows_read: cursor.rowsRead,
               rows_written: cursor.rowsWritten,
             },
           };
+        } else {
+            throw new Error("Invalid request to /query/raw: missing 'sql' or 'transaction'");
         }
 
-        return new Response(JSON.stringify({ result }), {
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
-      } catch (error: any) {
-        console.error("SQL execution error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
+       return new Response(JSON.stringify(finalResult), { 
+         headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+       });
       }
+      
+      // Not found
+      return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: this.corsHeaders });
+      
+    } catch (error: any) {
+      console.error("Error in DO fetch:", error);
+      return new Response(JSON.stringify({ error: error.message || "Internal Server Error" }), {
+        status: 500,
+        headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+      });
     }
-
-    return new Response("Not found", { status: 404 });
   }
 }

@@ -1,5 +1,6 @@
 import { ORMDO, createDBClient, DBConfig, DBClient } from "./queryState";
 import { adminHtml } from "./adminHtml";
+
 export { ORMDO };
 
 const dbConfig: DBConfig = {
@@ -380,3 +381,84 @@ export const handleDelete = async (
   // Default 404 response
   return new Response("Not found", { status: 404 });
 };
+
+// Define database schema for TypeScript
+interface Database {
+  users: {
+    id: string;
+    name: string;
+    email: string;
+    created_at: Date;
+  };
+  posts: {
+    id: string;
+    user_id: string;
+    title: string;
+    content: string;
+    created_at: Date;
+  };
+}
+
+// Example using the Kysely integration with ORM-DO
+export async function exampleUsage(doNamespace: DurableObjectNamespace) {
+  // 1. Create the DB client with schema
+  const schema = `
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS posts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+  `;
+
+  const dbClient = createDBClient(doNamespace, { schema });
+  
+  // 2. Create a Kysely instance with the DB client
+  const db = createKysely<Database>(dbClient);
+  
+  // 3. Perform queries using Kysely's query builder
+  
+  // Insert a user
+  const userId = crypto.randomUUID();
+  await db
+    .insertInto('users')
+    .values({
+      id: userId,
+      name: 'John Doe',
+      email: 'john@example.com',
+      created_at: new Date().toISOString(),
+    })
+    .execute();
+  
+  // Insert a post for the user
+  const postId = crypto.randomUUID();
+  await db
+    .insertInto('posts')
+    .values({
+      id: postId,
+      user_id: userId,
+      title: 'My First Post',
+      content: 'Hello, world!',
+      created_at: new Date().toISOString(),
+    })
+    .execute();
+  
+  // Query with a join
+  const result = await db
+    .selectFrom('posts')
+    .innerJoin('users', 'users.id', 'posts.user_id')
+    .select(['posts.title', 'posts.content', 'users.name as author'])
+    .where('posts.id', '=', postId)
+    .executeTakeFirst();
+    
+  return result;
+}
