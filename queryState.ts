@@ -1025,6 +1025,7 @@ export class ORMDO {
     params: any[] = [],
     transaction_id: string
   ): Promise<any> {
+    console.log("___query", sql, params)
     const txContext = this.transactionContexts.get(transaction_id);
     if (!txContext || txContext.status !== 'active') {
       throw new Error(`Transaction not found or inactive: ${transaction_id}`);
@@ -1079,6 +1080,7 @@ export class ORMDO {
     params: any[] = [], 
     requestId: string
   ) {
+    console.log("___query", sql, params)
     try {
       const cursor = this.sql.exec(sql, ...params);
       const result = cursor.toArray();
