@@ -34,6 +34,11 @@ export interface TransactionResponse {
   results?: any[]; // Add results array to return query results
 }
 
+// WebSocket connection URL for clients
+export interface WebSocketConfig {
+  baseUrl: string; // Base URL for WebSocket connection
+}
+
 // Define specific return types based on raw vs regular format
 export type RawQueryResult = {
   columns: string[];
@@ -81,7 +86,101 @@ function getCorsHeaders() {
   };
 }
 
-// The main factory function that creates a query function and middleware
+/**
+ * Creates a database client with HTTP and WebSocket support
+ * 
+ * Example usage with WebSockets:
+ * ```typescript
+ * // Create the client
+ * const dbClient = createDBClient(env.ORMDO, { schema: SCHEMA });
+ * 
+ * // From your frontend JavaScript/TypeScript:
+ * const wsUrl = dbClient.getWebSocketUrl();
+ * const socket = new WebSocket(wsUrl);
+ * 
+ * // Set up event handlers
+ * socket.onopen = () => {
+ *   console.log('Connected to database WebSocket');
+ * };
+ * 
+ * socket.onmessage = (event) => {
+ *   const response = JSON.parse(event.data);
+ *   console.log('Received:', response);
+ *   
+ *   // Handle different response types
+ *   if (response.type === 'connection_established') {
+ *     // Connection established successfully
+ *     console.log('Connected with session ID:', response.wsSessionId);
+ *   } else if (response.type === 'query_result') {
+ *     // Process query results
+ *     console.log('Query result for request:', response.requestId);
+ *     processResults(response.result);
+ *   } else if (response.type === 'transaction_result') {
+ *     // Handle transaction results
+ *     console.log('Transaction:', response.transaction_id, response.status);
+ *   } else if (response.type === 'database_change') {
+ *     // Change Data Capture (CDC) event
+ *     console.log('Database change in tables:', response.tables);
+ *     console.log('Operation:', response.operation);
+ *     console.log('Rows affected:', response.rowsAffected);
+ *     
+ *     // Refresh UI or data based on changes
+ *     if (response.tables.includes('users')) {
+ *       refreshUsersList();
+ *     }
+ *   } else if (response.type === 'transaction_committed') {
+ *     // Transaction commit CDC event
+ *     console.log('Transaction committed affecting tables:', response.tables);
+ *     // Refresh affected data
+ *   }
+ * };
+ * 
+ * // Execute a query
+ * socket.send(JSON.stringify({
+ *   action: 'query',
+ *   requestId: 'unique-query-id',
+ *   sql: 'SELECT * FROM users LIMIT 5',
+ *   params: []
+ * }));
+ * 
+ * // Start a transaction
+ * socket.send(JSON.stringify({
+ *   action: 'transaction',
+ *   operation: 'begin',
+ *   requestId: 'tx-request-1'
+ * }));
+ * 
+ * // Use a transaction
+ * socket.send(JSON.stringify({
+ *   action: 'query',
+ *   requestId: 'tx-query-1',
+ *   sql: 'INSERT INTO users (name) VALUES (?)',
+ *   params: ['User 1'],
+ *   transaction_id: 'received-transaction-id' // From the 'begin' response
+ * }));
+ * 
+ * // Commit a transaction
+ * socket.send(JSON.stringify({
+ *   action: 'transaction',
+ *   operation: 'commit',
+ *   requestId: 'tx-commit-1',
+ *   transaction_id: 'received-transaction-id'
+ * }));
+ * ```
+ * 
+ * Change Data Capture (CDC):
+ * WebSocket connections automatically receive change notifications when data is
+ * modified in the database. This enables real-time updates in your application
+ * without polling. The server broadcasts events to all connected clients when:
+ * - INSERT, UPDATE, or DELETE operations are executed
+ * - Transactions with write operations are committed
+ * 
+ * CDC events include:
+ * - The affected tables
+ * - The type of operation
+ * - Number of rows affected
+ * - Timestamp of the change
+ */
 export function createDBClient<T extends DBConfig>(
   doNamespace: DurableObjectNamespace,
   config: T,
@@ -223,6 +322,13 @@ export function createDBClient<T extends DBConfig>(
       );
   }
 
+  // Generate WebSocket connection URL
+  function getWebSocketUrl(options: { secure?: boolean, host?: string } = {}): string {
+    const protocol = options.secure !== false ? 'wss' : 'ws';
+    const host = options.host || (typeof location !== 'undefined' ? location.host : '');
+    return `${protocol}://${host}/socket`;
+  }
+
   // --- Middleware Function (Largely unchanged) ---
   async function middleware(
     request: Request,
@@ -295,6 +401,9 @@ export function createDBClient<T extends DBConfig>(
     rawQuery,
     transactionQuery, // Expose batch query method
     middleware,
+    
+    // WebSocket connection helper
+    getWebSocketUrl,
 
     // Skeleton implementations for transaction methods
     beginTransaction: async () => {
@@ -344,6 +453,9 @@ export type DBClient = {
     request: Request,
     options?: MiddlewareOptions,
   ) => Promise<Response | undefined>;
+  
+  // WebSocket utilities
+  getWebSocketUrl: (options?: { secure?: boolean, host?: string }) => string;
 
   // Interactive transaction methods
   beginTransaction: () => Promise<QueryResult<TransactionResponse>>;
@@ -364,6 +476,9 @@ export class ORMDO {
 
   private corsHeaders = getCorsHeaders();
 
+  // WebSocket connection management
+  private connections = new Map<string, WebSocket>();
+
   // Transaction context management
   private transactionContexts: Map<string, {
     id: string;
@@ -380,13 +495,26 @@ export class ORMDO {
   constructor(state: DurableObjectState) {
     this.state = state;
     this.sql = state.storage.sql;
-    this.state.storage.get("initialized_at").then(val => { this.initialized = !!val; });
+    
+    // Initialize database in constructor
+    this.state.storage.get("initialized_at").then(val => { 
+      this.initialized = !!val;
+      if (!this.initialized) {
+        this.initializeDatabase().catch(err => 
+          console.error("Failed to initialize database:", err));
+      }
+    });
 
     // Load transaction contexts from storage
     this.loadTransactionContexts();
 
     // Set up periodic cleanup of stale transactions
     this.setupTransactionCleaner();
+    
+    // Set up WebSocket event handlers for any existing connections
+    this.state.getWebSockets().forEach(ws => {
+      this.setupWebSocketHandlers(ws);
+    });
   }
 
   // Load transaction contexts from persistent storage
@@ -579,7 +707,7 @@ export class ORMDO {
     return null; // No conflicts
   }
 
-  // Safely clean up a transaction after a delay
+  // Clean up a transaction after a delay
   private async cleanupTransactionAfterDelay(transactionId: string, delayMs: number): Promise<void> {
     // Use a Promise with a timeout instead of setTimeout
     await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -596,6 +724,23 @@ export class ORMDO {
     } catch (error) {
       // Log but don't throw to prevent DO crashes
       console.error(`Error during delayed cleanup of transaction ${transactionId}:`, error);
+    }
+  }
+
+  // Broadcast an event to all connected WebSocket clients
+  private broadcastEvent(event: { type: string; [key: string]: any }) {
+    const message = JSON.stringify(event);
+    console.log(`Broadcasting event ${event.type} to ${this.connections.size} clients`);
+    
+    // Send to all connected clients
+    for (const [sessionId, ws] of this.connections.entries()) {
+      try {
+        ws.send(message);
+      } catch (err) {
+        console.error(`Failed to send to client ${sessionId}:`, err);
+        // Remove broken connections
+        this.connections.delete(sessionId);
+      }
     }
   }
 
@@ -642,12 +787,276 @@ export class ORMDO {
     }
   }
 
+  // Create a method to handle new WebSocket connections
+  private handleWebSocketConnection(): Response {
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+    const wsSessionId = crypto.randomUUID();
+
+    // Accept the WebSocket connection
+    this.state.acceptWebSocket(server);
+    
+    // Store the connection with its ID
+    this.connections.set(wsSessionId, server);
+    
+    // Set up event handlers
+    this.setupWebSocketHandlers(server, wsSessionId);
+    
+    return new Response(null, { 
+      status: 101, 
+      webSocket: client 
+    });
+  }
+
+  // Set up handlers for WebSocket events
+  private setupWebSocketHandlers(ws: WebSocket, wsSessionId?: string) {
+    ws.addEventListener('message', async (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        await this.handleWebSocketMessage(ws, message);
+      } catch (error) {
+        console.error("Error processing WebSocket message:", error);
+        ws.send(JSON.stringify({
+          error: "Failed to process message"
+        }));
+      }
+    });
+    
+    ws.addEventListener('close', (event) => {
+      // Clean up connection
+      if (wsSessionId) {
+        this.connections.delete(wsSessionId);
+      }
+      console.log(`WebSocket connection closed: ${event.code}`);
+    });
+    
+    // Send initial connection confirmation
+    ws.send(JSON.stringify({
+      type: 'connection_established',
+      wsSessionId
+    }));
+  }
+
+  // Handle different types of WebSocket messages
+  private async handleWebSocketMessage(ws: WebSocket, message: any) {
+    // Ensure DB is initialized
+    if (!this.initialized) {
+      await this.initializeDatabase();
+    }
+    
+    if (message.action === 'query') {
+      try {
+        const { sql, params = [], transaction_id, requestId } = message;
+        
+        // Handle query within transaction context
+        if (transaction_id) {
+          const txContext = this.transactionContexts.get(transaction_id);
+          if (!txContext || txContext.status !== 'active') {
+            throw new Error(`Transaction not found or inactive: ${transaction_id}`);
+          }
+          
+          // Update activity timestamp
+          txContext.lastActivity = Date.now();
+          
+          // Parse SQL to identify affected tables
+          const affectedTables = this.extractAffectedTables(sql);
+          
+          // Check if read-only or write operation
+          const isWrite = /INSERT|UPDATE|DELETE|CREATE|DROP|ALTER/i.test(sql);
+          
+          // For write operations, track tables being written to
+          if (isWrite) {
+            affectedTables.forEach(table => txContext.writeTables.add(table));
+          } else {
+            // For read operations, track tables being read from
+            affectedTables.forEach(table => txContext.readTables.add(table));
+          }
+          
+          // Look for conflicts with other active transactions
+          const conflictingTxId = this.hasConflictingTransaction(transaction_id, affectedTables, isWrite);
+          if (conflictingTxId) {
+            throw new Error(`Transaction conflict detected with transaction ${conflictingTxId}`);
+          }
+          
+          // Store operation for later execution at commit time
+          txContext.operations.push({ sql, params });
+          
+          // Execute the query
+          const cursor = this.sql.exec(sql, ...params);
+          const result = cursor.toArray();
+          
+          // Store result for later reference
+          txContext.results.push(result);
+          
+          // Update transaction context in storage
+          await this.saveTransactionContext(transaction_id, txContext);
+          
+          // Broadcast CDC events for data modifications (if any connected clients)
+          if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+            const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+            const tables = this.extractAffectedTables(sql);
+            
+            // Broadcast a change event to all connected clients
+            if (operationType && tables.length > 0) {
+              this.broadcastEvent({
+                type: 'database_change',
+                operation: operationType,
+                tables,
+                rowsAffected: cursor.rowsWritten,
+                timestamp: Date.now()
+              });
+            }
+          }
+          
+          ws.send(JSON.stringify({
+            type: 'query_result',
+            requestId,
+            result,
+            transaction_id
+          }));
+        } else {
+          // Regular non-transactional query
+          const cursor = this.sql.exec(sql, ...params);
+          const result = cursor.toArray();
+          
+          // Broadcast CDC events for data modifications (if any connected clients)
+          if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+            const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+            const tables = this.extractAffectedTables(sql);
+            
+            // Broadcast a change event to all connected clients
+            if (operationType && tables.length > 0) {
+              this.broadcastEvent({
+                type: 'database_change',
+                operation: operationType,
+                tables,
+                rowsAffected: cursor.rowsWritten,
+                timestamp: Date.now()
+              });
+            }
+          }
+          
+          ws.send(JSON.stringify({
+            type: 'query_result',
+            requestId,
+            result
+          }));
+        }
+      } catch (error: any) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          requestId: message.requestId,
+          error: error.message
+        }));
+      }
+    } else if (message.action === 'transaction') {
+      // Handle transaction operations (beginTransaction, commitTransaction, etc.)
+      const { operation, transaction_id } = message;
+      
+      if (operation === 'begin') {
+        try {
+          const txId = crypto.randomUUID();
+          const bookmark = await this.state.storage.getCurrentBookmark();
+
+          const txContext = {
+            id: txId,
+            bookmark,
+            operations: [],
+            readTables: new Set<string>(),
+            writeTables: new Set<string>(),
+            startTime: Date.now(),
+            lastActivity: Date.now(),
+            status: 'active' as TransactionStatus,
+            results: []
+          };
+
+          this.transactionContexts.set(txId, txContext);
+          await this.saveTransactionContext(txId, txContext);
+
+          ws.send(JSON.stringify({
+            type: 'transaction_result',
+            requestId: message.requestId,
+            transaction_id: txId,
+            status: 'active'
+          }));
+        } catch (error: any) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            requestId: message.requestId,
+            error: error.message
+          }));
+        }
+      } else if (['commit', 'rollback'].includes(operation) && transaction_id) {
+        // Handle commit/rollback operations
+        // Implementation similar to HTTP endpoints
+        try {
+          const txContext = this.transactionContexts.get(transaction_id);
+          if (!txContext || txContext.status !== 'active') {
+            throw new Error(`Transaction not found or inactive: ${transaction_id}`);
+          }
+          
+          txContext.status = operation === 'commit' ? 'committed' : 'rolledback';
+          txContext.lastActivity = Date.now();
+          
+          await this.saveTransactionContext(transaction_id, txContext);
+          
+          this.cleanupTransactionAfterDelay(transaction_id, 60000).catch(e => {
+            console.error(`Error in ${operation} transaction ${transaction_id}:`, e);
+          });
+          
+          // For commit operations, also broadcast CDC events for the transaction
+          if (operation === 'commit' && this.connections.size > 1) {
+            try {
+              const writeOperations = txContext.operations.filter(op => 
+                /INSERT|UPDATE|DELETE/i.test(op.sql)
+              );
+              
+              if (writeOperations.length > 0) {
+                const affectedTables = Array.from(txContext.writeTables);
+                
+                // Broadcast transaction commit event
+                this.broadcastEvent({
+                  type: 'transaction_committed',
+                  transaction_id,
+                  tables: affectedTables,
+                  operationCount: writeOperations.length,
+                  timestamp: Date.now()
+                });
+              }
+            } catch (error) {
+              console.error('Error broadcasting transaction event:', error);
+            }
+          }
+          
+          ws.send(JSON.stringify({
+            type: 'transaction_result',
+            requestId: message.requestId,
+            transaction_id,
+            status: txContext.status,
+            results: txContext.results
+          }));
+        } catch (error: any) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            requestId: message.requestId,
+            error: error.message
+          }));
+        }
+      }
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: this.corsHeaders });
+    }
+
+    // Handle WebSocket connections
+    if (path === "/socket") {
+      return this.handleWebSocketConnection();
     }
 
     try {
@@ -782,6 +1191,23 @@ export class ORMDO {
 
             console.log(`TX ${transaction_id}: Executed operation #${txContext.operations.length}: ${sql.substring(0, 80)}...`);
 
+            // Broadcast CDC events for data modifications (if any connected clients)
+            if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+              const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+              const tables = this.extractAffectedTables(sql);
+              
+              // Broadcast a change event to all connected clients
+              if (operationType && tables.length > 0) {
+                this.broadcastEvent({
+                  type: 'database_change',
+                  operation: operationType,
+                  tables,
+                  rowsAffected: cursor.rowsWritten,
+                  timestamp: Date.now()
+                });
+              }
+            }
+
             return new Response(JSON.stringify(result), {
               headers: { ...this.corsHeaders, "Content-Type": "application/json" },
             });
@@ -796,6 +1222,23 @@ export class ORMDO {
           // Regular non-transactional query handling
           const cursor = this.sql.exec(sql, ...params);
           const result = cursor.toArray();
+
+          // Broadcast CDC events for data modifications (if any connected clients)
+          if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+            const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+            const tables = this.extractAffectedTables(sql);
+            
+            // Broadcast a change event to all connected clients
+            if (operationType && tables.length > 0) {
+              this.broadcastEvent({
+                type: 'database_change',
+                operation: operationType,
+                tables,
+                rowsAffected: cursor.rowsWritten,
+                timestamp: Date.now()
+              });
+            }
+          }
 
           return new Response(JSON.stringify(result), {
             headers: { ...this.corsHeaders, "Content-Type": "application/json" },
