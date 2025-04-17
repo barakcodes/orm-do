@@ -227,12 +227,14 @@ export const handlePost = async (
         .returning(["id", "name", "email", "created_at"])
         .executeTakeFirst();
         console.log("__user", user)
+        const inserted = await trx.selectFrom("users").selectAll().where("id", "=", userId).executeTakeFirst();
+        console.log("__inserted", inserted)
 
         await trx.updateTable("users")
         .set({
           name: `${user?.name}-123`
         })
-        .where("id", "=", userId)
+        .where("id", "=", user?.id|| userId)
         .execute();
 
         return user
