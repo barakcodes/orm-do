@@ -159,7 +159,7 @@ const handleGet = async (
     try {
       const user = await db
         .selectFrom("users")
-        .selectAll()
+        .select("*")
         .where("id", "=", userId) // Use the base type for comparison
         .executeTakeFirst();
 
@@ -225,16 +225,7 @@ const handlePost = async (
           }
         );
       }
-  console.log("___insertInto", body)
-      const userId = body.id;
-      await db
-      .insertInto("users")
-      .values({
-        id: userId, // Pass the required id
-        name: body.name,
-        email: body.email,
-      })
-      .executeTakeFirstOrThrow();
+      const userId = crypto.randomUUID();
       // Use db.transaction for atomicity
       const user = await db.transaction(async (trx) => {
         // Insert user
@@ -245,6 +236,7 @@ const handlePost = async (
             name: body.name,
             email: body.email,
           })
+       
           .execute();
         
         // Select the inserted user (since returning is not built-in)
@@ -252,14 +244,16 @@ const handlePost = async (
           .selectAll()
           .where("id", "=", userId)
           .executeTakeFirstOrThrow(); // Throw if not found (shouldn't happen)
+
           
          // Update example within transaction
-         await trx.update("users")
+        const updatedUser = await trx.update("users")
            .set({
              name: `${insertedUser.name}-Updated`
            })
            .where("id", "=", userId)
-           .execute();
+           .returning("*")
+           .executeTakeFirst();
 
         // Select again to get the final state after update
          const finalUser = await trx.selectFrom("users")
@@ -336,7 +330,7 @@ const handlePut = async (
       // Check if user exists before update
       const existingUser = await db
         .selectFrom("users")
-        .select('id') // Select minimal data
+        .select(['id']) // Select minimal data
         .where("id", "=", userId)
         .executeTakeFirst();
 

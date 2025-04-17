@@ -146,6 +146,7 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
   private insertValues: Insertable<DB[TB]>[] | null = null; // Data for INSERT.
   private updateValues: Updateable<DB[TB]> | null = null; // Data for UPDATE.
   private isDeleteOperation = false; // Flag for DELETE operations.
+  private returningColumns: string[] | null = null; // Added for RETURNING clause
 
   /**
    * Creates a QueryBuilder instance.
@@ -163,12 +164,27 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
 
   // ----- Select operations -----
   /** Specifies columns to select. */
-  select<C extends (keyof Selectable<DB[TB]> & string)[]>(...columns: C): QueryBuilder<DB, TB, Pick<Selectable<DB[TB]>, C[number]>> {
-    this.selectedColumns = columns as string[];
-    return this as any; // Type casting necessary due to complex generic manipulation.
+  // Overload 1: Selecting specific columns
+  select<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C): QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+  // Overload 2: Selecting all columns using '*'
+  select(columns: '*'): QueryBuilder<DB, TB, Selectable<DB[TB]>>;
+  // Implementation signature
+  select<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C | '*'): QueryBuilder<DB, TB, any> {
+    if (columns === '*') {
+      this.selectedColumns = ['*'];
+      // Cast to the return type defined in the overload signature for '*'
+      return this as unknown as QueryBuilder<DB, TB, Selectable<DB[TB]>>;
+    } else if (Array.isArray(columns)) {
+      this.selectedColumns = columns as string[];
+      // Cast to the return type defined in the overload signature for specific columns
+      return this as unknown as QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+    } else {
+      // Should not happen with the overloads, but good practice
+      throw new Error("Invalid argument passed to .select(). Expected '*' or an array of column names.");
+    }
   }
 
-  /** Selects all columns ('*'). */
+  /** Selects all columns. Equivalent to `select('*')`. */
   selectAll(): QueryBuilder<DB, TB, Selectable<DB[TB]>> {
     this.selectedColumns = ['*'];
     return this as any; // Cast needed due to SelectResult complexity
@@ -275,12 +291,11 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
   // ----- Execution methods -----
   /** 
    * Executes the built query (SELECT, INSERT, UPDATE, DELETE).
-   * Returns results for SELECT, typically row count info for others (depends on client).
+   * Returns results for SELECT or for operations with RETURNING.
+   * The exact return type depends on the operation and if .returning() was used.
    */
   async execute(): Promise<SelectResult[]> {
-    console.log("___execute", this.transactionId)
     const { sql, params } = this.buildQuery();
-    console.log("___execute", sql, params)
     let result;
     if (this.transactionId) {
       result = await this.client.queryWithTransaction<SelectResult>(this.transactionId, sql, params);
@@ -339,7 +354,6 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
   // ----- Insert operations -----
   /** Specifies the record(s) to insert. */
   values(records: Insertable<DB[TB]> | Insertable<DB[TB]>[]): this {
-    console.log("___values", records)
     this.insertValues = Array.isArray(records) ? records : [records];
     return this;
   }
@@ -349,6 +363,39 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
   set(values: Updateable<DB[TB]>): this {
     this.updateValues = values;
     return this;
+  }
+
+  // ----- RETURNING clause (Overloaded) -----
+  /**
+   * Specifies columns to return after an INSERT, UPDATE, or DELETE operation.
+   * Note: The underlying database and client must support the RETURNING clause.
+   * @param columns Array of column names to return.
+   */
+  returning<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C): QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+  /**
+   * Specifies returning all columns ('*') after an INSERT, UPDATE, or DELETE operation.
+   * Note: The underlying database and client must support the RETURNING clause.
+   * @param columns The literal string '*'.
+   */
+  returning(columns: '*'): QueryBuilder<DB, TB, Selectable<DB[TB]>>;
+  // Implementation signature
+  returning<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C | '*'): QueryBuilder<DB, TB, any> {
+      if (!this.insertValues && !this.updateValues && !this.isDeleteOperation) {
+          throw new Error(".returning() can only be used after insertInto(), update(), or deleteFrom().");
+      }
+      
+      if (columns === '*') {
+          this.returningColumns = ['*'];
+          // Cast to the correct return type defined in the overload signature for '*'
+          return this as unknown as QueryBuilder<DB, TB, Selectable<DB[TB]>>;
+      } else if (Array.isArray(columns)) {
+          this.returningColumns = columns as string[];
+           // Cast to the correct return type defined in the overload signature for array
+          return this as unknown as QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+      } else {
+          // Should not happen with the overload signatures, but good practice
+          throw new Error("Invalid argument passed to .returning(). Expected '*' or an array of column names.");
+      }
   }
 
   // ----- Query building -----
@@ -418,6 +465,11 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
       valuePlaceholders.push(`(${rowPlaceholders.join(', ')})`);
     }
     sql += ` VALUES ${valuePlaceholders.join(', ')}`;
+    
+    // Append RETURNING clause if specified
+    if (this.returningColumns && this.returningColumns.length > 0) {
+        sql += ` RETURNING ${this.returningColumns.join(', ')}`;
+    }
     return { sql, params };
   }
 
@@ -447,6 +499,11 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
       });
       sql += whereExpressions.join(' AND ');
     }
+    
+    // Append RETURNING clause if specified
+    if (this.returningColumns && this.returningColumns.length > 0) {
+        sql += ` RETURNING ${this.returningColumns.join(', ')}`;
+    }
     return { sql, params };
   }
 
@@ -466,6 +523,11 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
         }
       });
       sql += whereExpressions.join(' AND ');
+    }
+    
+    // Append RETURNING clause if specified
+    if (this.returningColumns && this.returningColumns.length > 0) {
+        sql += ` RETURNING ${this.returningColumns.join(', ')}`;
     }
     return { sql, params };
   }
@@ -498,41 +560,43 @@ export class DB<DBType extends Database = Database> {
     return new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
   }
 
-  /** Starts an INSERT query chain. Requires `.values().execute()` to complete. */
-  insertInto<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'values' | 'execute'> {
-    console.log("___insertInto", table)
-    const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
-    // Return only the necessary methods for insert flow
+  /** Starts an INSERT query chain. Requires `.values().execute()` or `.values().returning().execute()` to complete. */
+  insertInto<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'values' | 'returning' | 'execute'> {
+      const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
+    // Return methods for insert flow, including returning()
     return {
-        values: qb.values.bind(qb), // Ensure 'this' context is bound correctly
+        values: qb.values.bind(qb), 
+        returning: qb.returning.bind(qb),
         execute: qb.execute.bind(qb)
     };
   }
 
-  /** Starts an UPDATE query chain. Requires `.set()` and typically `.where().execute()` to complete. */
-  update<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'set' | 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'execute'> {
+  /** Starts an UPDATE query chain. Requires `.set()` and typically `.where().execute()` or `.set().where().returning().execute()` to complete. */
+  update<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'set' | 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute'> {
     const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
-    // Return only the necessary methods for update flow
+    // Return methods for update flow, including returning()
     return {
         set: qb.set.bind(qb),
         where: qb.where.bind(qb),
         whereEquals: qb.whereEquals.bind(qb),
         whereIn: qb.whereIn.bind(qb),
         whereLike: qb.whereLike.bind(qb),
+        returning: qb.returning.bind(qb),
         execute: qb.execute.bind(qb)
     };
   }
 
-  /** Starts a DELETE query chain. Typically requires `.where().execute()` to complete. */
-  deleteFrom<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'execute'> {
+  /** Starts a DELETE query chain. Typically requires `.where().execute()` or `.where().returning().execute()` to complete. */
+  deleteFrom<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute'> {
     const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
     qb['isDeleteOperation'] = true; // Set internal flag
-    // Return only the necessary methods for delete flow
+    // Return methods for delete flow, including returning()
      return {
         where: qb.where.bind(qb),
         whereEquals: qb.whereEquals.bind(qb),
         whereIn: qb.whereIn.bind(qb),
         whereLike: qb.whereLike.bind(qb),
+        returning: qb.returning.bind(qb),
         execute: qb.execute.bind(qb)
     };
   }
