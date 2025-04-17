@@ -1,13 +1,9 @@
 {
   "name": "orm-do",
-  "main": "example.ts",
+  "main": "test.ts",
   "compatibility_date": "2024-04-15",
   "dev": {
     "port": 3000
-  },
-  "route": {
-    "custom_domain": true,
-    "pattern": "ormdo.wilmake.com"
   },
   "durable_objects": {
     "bindings": [

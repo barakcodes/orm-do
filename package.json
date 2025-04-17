@@ -1,5 +1,11 @@
 {
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250415.0"
+    "@cloudflare/workers-types": "^4.20250415.0",
+    "kysely": "0.28.0",
+    "wrangler": "4.11.1"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   }
 }

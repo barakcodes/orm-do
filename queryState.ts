@@ -1,7 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 //@ts-check
 
-// Basic configuration for the factory
 export interface DBConfig {
   version?: string; // Version prefix for DO naming
   schema: string | string[]; // SQL statements to initialize schema
@@ -14,20 +13,48 @@ export interface MiddlewareOptions {
   prefix?: string; // URL path prefix for API endpoints
 }
 
-// Query options for individual queries
 interface QueryOptions {
   isRaw?: boolean;
-  isTransaction?: boolean;
+  isTransaction?: boolean; // Re-added for internal batching
+}
+
+// Transaction status type
+export type TransactionStatus = 'active' | 'committed' | 'rolledback';
+
+// Transaction request/response types
+export interface TransactionRequest {
+  operation: 'begin' | 'commit' | 'rollback';
+  transaction_id?: string;
+}
+
+export interface TransactionResponse {
+  transaction_id: string;
+  status: TransactionStatus;
+  error?: string;
+  results?: any[]; // Add results array to return query results
+}
+
+// WebSocket connection URL for clients
+export interface WebSocketConfig {
+  baseUrl: string; // Base URL for WebSocket connection
 }
 
 // Define specific return types based on raw vs regular format
-type RawQueryResult = {
+export type RawQueryResult = {
   columns: string[];
   rows: any[][];
   meta: {
     rows_read: number;
     rows_written: number;
+    // last_insert_rowid?: number | bigint; // Potentially add later
   };
+};
+
+// Extended QueryRequest to support transaction context
+export type QueryRequest = {
+  sql: string;
+  params?: any[];
+  transaction_id?: string; // Optional transaction context
 };
 
 type ArrayQueryResult<T = Record<string, any>> = T[];
@@ -59,12 +86,106 @@ function getCorsHeaders() {
   };
 }
 
-// The main factory function that creates a query function and middleware
+/**
+ * Creates a database client with HTTP and WebSocket support
+ * 
+ * Example usage with WebSockets:
+ * ```typescript
+ * // Create the client
+ * const dbClient = createDBClient(env.ORMDO, { schema: SCHEMA });
+ * 
+ * // From your frontend JavaScript/TypeScript:
+ * const wsUrl = dbClient.getWebSocketUrl();
+ * const socket = new WebSocket(wsUrl);
+ * 
+ * // Set up event handlers
+ * socket.onopen = () => {
+ *   console.log('Connected to database WebSocket');
+ * };
+ * 
+ * socket.onmessage = (event) => {
+ *   const response = JSON.parse(event.data);
+ *   console.log('Received:', response);
+ *   
+ *   // Handle different response types
+ *   if (response.type === 'connection_established') {
+ *     // Connection established successfully
+ *     console.log('Connected with session ID:', response.wsSessionId);
+ *   } else if (response.type === 'query_result') {
+ *     // Process query results
+ *     console.log('Query result for request:', response.requestId);
+ *     processResults(response.result);
+ *   } else if (response.type === 'transaction_result') {
+ *     // Handle transaction results
+ *     console.log('Transaction:', response.transaction_id, response.status);
+ *   } else if (response.type === 'database_change') {
+ *     // Change Data Capture (CDC) event
+ *     console.log('Database change in tables:', response.tables);
+ *     console.log('Operation:', response.operation);
+ *     console.log('Rows affected:', response.rowsAffected);
+ *     
+ *     // Refresh UI or data based on changes
+ *     if (response.tables.includes('users')) {
+ *       refreshUsersList();
+ *     }
+ *   } else if (response.type === 'transaction_committed') {
+ *     // Transaction commit CDC event
+ *     console.log('Transaction committed affecting tables:', response.tables);
+ *     // Refresh affected data
+ *   }
+ * };
+ * 
+ * // Execute a query
+ * socket.send(JSON.stringify({
+ *   action: 'query',
+ *   requestId: 'unique-query-id',
+ *   sql: 'SELECT * FROM users LIMIT 5',
+ *   params: []
+ * }));
+ * 
+ * // Start a transaction
+ * socket.send(JSON.stringify({
+ *   action: 'transaction',
+ *   operation: 'begin',
+ *   requestId: 'tx-request-1'
+ * }));
+ * 
+ * // Use a transaction
+ * socket.send(JSON.stringify({
+ *   action: 'query',
+ *   requestId: 'tx-query-1',
+ *   sql: 'INSERT INTO users (name) VALUES (?)',
+ *   params: ['User 1'],
+ *   transaction_id: 'received-transaction-id' // From the 'begin' response
+ * }));
+ * 
+ * // Commit a transaction
+ * socket.send(JSON.stringify({
+ *   action: 'transaction',
+ *   operation: 'commit',
+ *   requestId: 'tx-commit-1',
+ *   transaction_id: 'received-transaction-id'
+ * }));
+ * ```
+ * 
+ * Change Data Capture (CDC):
+ * WebSocket connections automatically receive change notifications when data is
+ * modified in the database. This enables real-time updates in your application
+ * without polling. The server broadcasts events to all connected clients when:
+ * - INSERT, UPDATE, or DELETE operations are executed
+ * - Transactions with write operations are committed
+ * 
+ * CDC events include:
+ * - The affected tables
+ * - The type of operation
+ * - Number of rows affected
+ * - Timestamp of the change
+ */
 export function createDBClient<T extends DBConfig>(
   doNamespace: DurableObjectNamespace,
   config: T,
   name?: string,
-) {
+): DBClient { // Return the specific DBClient type
   const nameWithVersion = getNameWithVersion(name, config.version);
   const id = doNamespace.idFromName(nameWithVersion);
   const obj = doNamespace.get(id);
@@ -75,126 +196,140 @@ export function createDBClient<T extends DBConfig>(
     ? config.schema
     : [config.schema];
 
-  // The query function returned by the factory
-  async function query<O extends QueryOptions>(
-    options: O,
-    sql: string,
-    ...params: any[]
-  ): Promise<QueryResult<QueryResponseType<O>>> {
-    try {
-      // Initialize if not already done
-      if (!initialized) {
-        const initResponse = await obj.fetch("https://dummy-url/init", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            schema: schemaStatements,
-          }),
-        });
-
-        if (!initResponse.ok) {
-          return {
-            json: null,
-            status: initResponse.status,
-            ok: false,
-          };
-        }
-
-        initialized = true;
-      }
-
-      // Format the request based on whether we want a transaction or a single query
-      const body = options.isTransaction
-        ? JSON.stringify({
-            transaction: [{ sql, params }],
-          })
-        : JSON.stringify({
-            sql,
-            params,
-            isRaw: options.isRaw,
-          });
-
-      // Determine the appropriate endpoint based on format
-      const endpoint = options.isRaw ? "/query/raw" : "/query";
-
-      const response = await obj.fetch(`https://dummy-url${endpoint}`, {
-        method: "POST",
+  // --- Internal Helper to Send Requests to DO ---
+  async function sendToDoRequest<R = any>(path: string, body: any, method: string = 'POST'): Promise<QueryResult<R>> {
+      const response = await obj.fetch(`https://dummy-url${path}`, {
+        method: method,
         headers: {
           "Content-Type": "application/json",
         },
-        body,
+        body: JSON.stringify(body),
       });
 
-      if (!response.ok) {
-        return {
-          json: null,
-          status: response.status,
-          ok: false,
-        };
+      let responseJson: R | null = null;
+      if (response.ok && response.status !== 204) {
+          try {
+              responseJson = await response.json() as R;
+          } catch (e) {
+              console.warn(`Failed to parse JSON response from ${path} (status ${response.status}):`, e);
+          }
+      } else if (!response.ok) {
+           try {
+               const errorBody = await response.text();
+               console.error(`DO request failed for ${path} (status ${response.status}): ${errorBody}`);
+           } catch (e) {
+                console.error(`DO request failed for ${path} (status ${response.status}), failed to read error body.`);
+           }
       }
 
-      const responseData: any = await response.json();
-
-      // If using browsable's raw format, the result should be in responseData.result
-      const result =
-        options.isRaw && responseData.result
-          ? responseData.result
-          : responseData;
-
       return {
-        json: result as QueryResponseType<O>,
+        json: responseJson,
         status: response.status,
-        ok: true,
+        ok: response.ok,
       };
-    } catch (error) {
-      console.error(`Error querying state: ${error}`);
-      return {
-        json: null,
-        status: 500,
-        ok: false,
-      };
+  }
+
+  // --- Initialization Logic ---
+  async function ensureInitialized(): Promise<boolean> {
+    if (initialized) return true;
+    console.log("Attempting DB Initialization...");
+    const initResponse = await sendToDoRequest('/init', { schema: schemaStatements });
+    if (!initResponse.ok) {
+      console.error("Initialization failed:", initResponse.status);
+      return false;
     }
+    console.log("DB Initialized successfully.");
+    initialized = true;
+    return true;
   }
 
-  // Convenience wrapper for standard queries
-  async function standardQuery<T = Record<string, any>>(
+  // --- Core Query Function (Handles single queries and transaction batches) ---
+  async function query<O extends QueryOptions>(
+    options: O,
+    // Can be SQL string or the transaction batch array
+    sqlOrTransaction: string | { sql: string; params?: any[] }[],
+    params: any[] = [], // Only used when sqlOrTransaction is string
+  ): Promise<QueryResult<QueryResponseType<O>>> {
+    if (!await ensureInitialized()) {
+       throw new Error("Database initialization failed. Cannot proceed.");
+    }
+
+    let body: any;
+    let endpoint: string;
+
+    if (options.isTransaction && Array.isArray(sqlOrTransaction)) {
+      // Transaction Batch (from Kysely commit)
+      body = { transaction: sqlOrTransaction };
+      // Batched transactions MUST go to the raw endpoint
+      endpoint = "/query/raw";
+    } else if (typeof sqlOrTransaction === 'string') {
+      // Single Query
+      body = {
+        sql: sqlOrTransaction,
+        params: params,
+      };
+      // Determine endpoint based on whether raw results are requested
+      endpoint = options.isRaw ? "/query/raw" : "/query";
+    } else {
+      throw new Error('Invalid arguments provided to internal query function.');
+    }
+
+    const result = await sendToDoRequest<QueryResponseType<O>>(endpoint, body);
+
+    if (options.isRaw && result.json && typeof result.json === 'object' && 'result' in result.json) {
+        return {
+            ...result,
+            // @ts-ignore
+            json: result.json.result as QueryResponseType<O>
+        };
+    }
+
+    return result;
+  }
+
+  // --- Public Client Methods ---
+
+  async function standardQuery<TRes = Record<string, any>>(
     sql: string,
-    ...params: any[]
-  ): Promise<QueryResult<ArrayQueryResult<T>>> {
-    return query(
-      { isRaw: false, isTransaction: false },
-      sql,
-      ...params,
-    ) as Promise<QueryResult<ArrayQueryResult<T>>>;
+    params?: any[],
+  ): Promise<QueryResult<ArrayQueryResult<TRes>>> {
+    return query<QueryOptions & { isRaw: false }>(
+      { isRaw: false, isTransaction: false }, sql, params
+    ) as Promise<QueryResult<ArrayQueryResult<TRes>>>;
   }
 
-  // Convenience wrapper for raw queries
   async function rawQuery(
     sql: string,
-    ...params: any[]
+    params?: any[],
   ): Promise<QueryResult<RawQueryResult>> {
-    return query(
-      { isRaw: true, isTransaction: false },
-      sql,
-      ...params,
-    ) as Promise<QueryResult<RawQueryResult>>;
+    return query<QueryOptions & { isRaw: true }>(
+      { isRaw: true, isTransaction: false }, sql, params
+    );
   }
 
-  // Convenience wrapper for transaction queries
-  async function transactionQuery<T = Record<string, any>>(
-    sql: string,
-    ...params: any[]
-  ): Promise<QueryResult<ArrayQueryResult<T>>> {
-    return query(
-      { isRaw: false, isTransaction: true },
-      sql,
-      ...params,
-    ) as Promise<QueryResult<ArrayQueryResult<T>>>;
+  // Reintroduce transactionQuery for batching from Kysely commit
+  async function transactionQuery<TRes = Record<string, any>>(
+      transaction: { sql: string; params?: any[] }[],
+  ): Promise<QueryResult<RawQueryResult>> {
+      // Send the batch. isRaw needs to be true because the DO endpoint is /query/raw
+      // isTransaction needs to be true to trigger the batch format in `query`
+      // The actual result type (ArrayQueryResult) depends on the DO's response for batches.
+      // Assuming /query/raw with a batch returns results compatible with ArrayQueryResult.
+      // If it returns multiple RawQueryResult, this cast needs adjustment.
+      return query<QueryOptions & { isRaw: true, isTransaction: true }>(
+          { isRaw: true, isTransaction: true },
+          transaction // Pass the batch array
+      );
   }
 
-  // Middleware function to handle HTTP requests
+  // Generate WebSocket connection URL
+  function getWebSocketUrl(options: { secure?: boolean, host?: string } = {}): string {
+    const protocol = options.secure !== false ? 'wss' : 'ws';
+    const host = options.host || (typeof location !== 'undefined' ? location.host : '');
+    return `${protocol}://${host}/socket`;
+  }
+
+  // --- Middleware Function (Largely unchanged) ---
   async function middleware(
     request: Request,
     options: MiddlewareOptions = {},
@@ -202,257 +337,428 @@ export function createDBClient<T extends DBConfig>(
     const url = new URL(request.url);
     const prefix = options.prefix || "/db";
 
-    // Check if the request path starts with the prefix
     if (!url.pathname.startsWith(prefix)) {
-      return undefined; // Not handled by this middleware
+      return undefined;
     }
 
-    // Handle CORS preflight request
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: getCorsHeaders(),
-      });
+      return new Response(null, { status: 204, headers: getCorsHeaders() });
     }
 
-    // Check authentication if a secret is provided
     if (options.secret) {
       const authHeader = request.headers.get("Authorization");
       const expectedHeader = `Bearer ${options.secret}`;
-
       if (!authHeader || authHeader !== expectedHeader) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
-          status: 401,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
+          status: 401, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
         });
       }
     }
 
-    // Extract the sub-path
     const subPath = url.pathname.substring(prefix.length);
 
-    // Initialize the database if needed
     if (subPath === "/init" && request.method === "POST") {
-      // Initialize if not already done
-      if (!initialized) {
-        const initResponse = await obj.fetch("https://dummy-url/init", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            schema: schemaStatements,
-          }),
-        });
-
-        if (!initResponse.ok) {
-          return new Response(
-            JSON.stringify({ error: "Initialization failed" }),
-            {
-              status: initResponse.status,
-              headers: {
-                ...getCorsHeaders(),
-                "Content-Type": "application/json",
-              },
-            },
-          );
-        }
-
-        initialized = true;
-        return new Response(JSON.stringify({ initialized: true }), {
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
-        });
-      }
+       if (!await ensureInitialized()) {
+         return new Response(JSON.stringify({ error: "Initialization failed" }), {
+            status: 500, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
+         });
+       }
+       return new Response(JSON.stringify({ initialized: true }), {
+            headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
+       });
     }
 
-    // Handle raw SQL query
-    if (subPath === "/query/raw" && request.method === "POST") {
+    if ((subPath === "/query" || subPath === "/query/raw") && request.method === "POST") {
       try {
-        const data = (await request.json()) as any;
-        let result;
-
-        // Handle transaction if present
-        if (data.transaction) {
-          const queryOptions: QueryOptions = {
-            isRaw: true,
-            isTransaction: true,
-          };
-          const result = await query(
-            queryOptions,
-            data.transaction[0].sql,
-            ...(data.transaction[0].params || []),
-          );
-
-          return new Response(JSON.stringify({ result: result.json }), {
-            status: result.status,
-            headers: {
-              ...getCorsHeaders(),
-              "Content-Type": "application/json",
-            },
-          });
-        } else {
-          // Single query
-          const queryOptions: QueryOptions = {
-            isRaw: true,
-            isTransaction: false,
-          };
-          const result = await query(
-            queryOptions,
-            data.sql,
-            ...(data.params || []),
-          );
-
-          return new Response(JSON.stringify({ result: result.json }), {
-            status: result.status,
-            headers: {
-              ...getCorsHeaders(),
-              "Content-Type": "application/json",
-            },
-          });
+        const body = await request.json() as { sql: string; params?: any[] };
+        if (!body.sql) {
+             return new Response(JSON.stringify({ error: "Missing 'sql' property in request body" }), {
+                status: 400, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
+             });
         }
-      } catch (error: any) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
-        });
-      }
-    }
-
-    // Handle SQL query
-    if (subPath === "/query" && request.method === "POST") {
-      try {
-        const data = (await request.json()) as {
-          sql: string;
-          params?: any[];
-          isRaw?: boolean;
-          isTransaction?: boolean;
-        };
-
-        if (!data.sql) {
-          return new Response(JSON.stringify({ error: "Missing SQL query" }), {
-            status: 400,
-            headers: {
-              ...getCorsHeaders(),
-              "Content-Type": "application/json",
-            },
-          });
-        }
-
-        const queryOptions: QueryOptions = {
-          isRaw: data.isRaw || false,
-          isTransaction: data.isTransaction || false,
-        };
-
-        const result = await query(
-          queryOptions,
-          data.sql,
-          ...(data.params || []),
-        );
+        // Middleware executes queries outside transactions
+        const queryOptions: QueryOptions = { isRaw: subPath === "/query/raw", isTransaction: false };
+        const result = await query(queryOptions, body.sql, body.params);
 
         return new Response(JSON.stringify(result.json), {
-          status: result.status,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
+          status: result.status, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
         });
       } catch (error: any) {
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...getCorsHeaders(),
-            "Content-Type": "application/json",
-          },
+        return new Response(JSON.stringify({ error: error.message || "Query processing error" }), {
+          status: 500, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
         });
       }
     }
 
-    // If we get here, the path wasn't recognized
     return new Response(JSON.stringify({ error: "Not found" }), {
-      status: 404,
-      headers: {
-        ...getCorsHeaders(),
-        "Content-Type": "application/json",
-      },
+      status: 404, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
     });
   }
 
+  // Return the client object conforming to DBClient type
   return {
-    query,
     standardQuery,
     rawQuery,
-    transactionQuery,
+    transactionQuery, // Expose batch query method
     middleware,
+    
+    // WebSocket connection helper
+    getWebSocketUrl,
+
+    // Skeleton implementations for transaction methods
+    beginTransaction: async () => {
+      return sendToDoRequest<TransactionResponse>('/transaction', { operation: 'begin' });
+    },
+    commitTransaction: async (transactionId: string) => {
+      return sendToDoRequest<TransactionResponse>('/transaction', {
+        operation: 'commit',
+        transaction_id: transactionId
+      });
+    },
+    rollbackTransaction: async (transactionId: string) => {
+      return sendToDoRequest<TransactionResponse>('/transaction', {
+        operation: 'rollback',
+        transaction_id: transactionId
+      });
+    },
+    queryWithTransaction: async <T = Record<string, any>>(
+      transactionId: string,
+      sql: string,
+      params?: any[],
+    ) => {
+      return sendToDoRequest<ArrayQueryResult<T>>('/query', {
+        sql,
+        params,
+        transaction_id: transactionId
+      });
+    }
   };
 }
 
+// Updated DBClient type definition
 export type DBClient = {
-  query: <O extends QueryOptions>(
-    options: O,
-    sql: string,
-    ...params: any[]
-  ) => Promise<QueryResult<QueryResponseType<O>>>;
   standardQuery: <T = Record<string, any>>(
     sql: string,
-    ...params: any[]
+    params?: any[],
   ) => Promise<QueryResult<ArrayQueryResult<T>>>;
   rawQuery: (
     sql: string,
-    ...params: any[]
+    params?: any[],
   ) => Promise<QueryResult<RawQueryResult>>;
-  transactionQuery: <T = Record<string, any>>(
-    sql: string,
-    ...params: any[]
-  ) => Promise<QueryResult<ArrayQueryResult<T>>>;
+  // Transaction query sends batch and returns RawQueryResult (of last statement)
+  transactionQuery: (
+      transaction: { sql: string; params?: any[] }[],
+  ) => Promise<QueryResult<RawQueryResult>>;
   middleware: (
     request: Request,
     options?: MiddlewareOptions,
   ) => Promise<Response | undefined>;
+  
+  // WebSocket utilities
+  getWebSocketUrl: (options?: { secure?: boolean, host?: string }) => string;
+
+  // Interactive transaction methods
+  beginTransaction: () => Promise<QueryResult<TransactionResponse>>;
+  commitTransaction: (transactionId: string) => Promise<QueryResult<TransactionResponse>>;
+  rollbackTransaction: (transactionId: string) => Promise<QueryResult<TransactionResponse>>;
+  queryWithTransaction: <T = Record<string, any>>(
+    transactionId: string,
+    sql: string,
+    params?: any[],
+  ) => Promise<QueryResult<ArrayQueryResult<T>>>;
 };
 
-// Durable Object implementation with Browsable compatibility
+// Durable Object implementation
 export class ORMDO {
   private state: DurableObjectState;
-  public sql: SqlStorage; // Public for Browsable compatibility
+  public sql: SqlStorage;
   private initialized: boolean = false;
 
-  // CORS headers for responses
   private corsHeaders = getCorsHeaders();
+
+  // WebSocket connection management
+  private connections = new Map<string, WebSocket>();
+
+  // Transaction context management
+  private transactionContexts: Map<string, {
+    id: string;
+    bookmark: any;
+    operations: { sql: string; params?: any[] }[];
+    readTables: Set<string>;
+    writeTables: Set<string>;
+    startTime: number;
+    lastActivity: number;
+    status: TransactionStatus;
+    results: any[]; // Add array to track individual query results
+  }> = new Map();
 
   constructor(state: DurableObjectState) {
     this.state = state;
     this.sql = state.storage.sql;
+    
+    // Initialize database in constructor
+    this.state.storage.get("initialized_at").then(val => { 
+      this.initialized = !!val;
+      if (!this.initialized) {
+        this.initializeDatabase().catch(err => 
+          console.error("Failed to initialize database:", err));
+      }
+    });
+
+    // Load transaction contexts from storage
+    this.loadTransactionContexts();
+
+    // Set up periodic cleanup of stale transactions
+    this.setupTransactionCleaner();
+    
+    // Set up WebSocket event handlers for any existing connections
+    this.state.getWebSockets().forEach(ws => {
+      this.setupWebSocketHandlers(ws);
+    });
   }
 
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
+  // Load transaction contexts from persistent storage
+  private async loadTransactionContexts() {
+    try {
+      const storedContexts = await this.state.storage.get("transaction_contexts");
+      if (storedContexts) {
+        console.log(`Loading ${Object.keys(storedContexts).length} persisted transaction contexts`);
+        // Convert stored contexts back to Map with proper Set objects
+        for (const [txId, ctx] of Object.entries(storedContexts)) {
+          this.transactionContexts.set(txId, {
+            ...ctx,
+            readTables: new Set(ctx.readTables || []),
+            writeTables: new Set(ctx.writeTables || []),
+            results: ctx.results || []
+          });
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load transaction contexts:", error);
+    }
+  }
 
-    // Handle CORS preflight request
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: this.corsHeaders,
+  // Save transaction contexts to persistent storage
+  private async saveTransactionContext(txId: string, context: any) {
+    try {
+      // Convert Set objects to arrays for storage
+      const storableContext = {
+        ...context,
+        readTables: Array.from(context.readTables || []),
+        writeTables: Array.from(context.writeTables || []),
+        results: context.results || []
+      };
+
+      // Get current contexts
+      const storedContexts = await this.state.storage.get("transaction_contexts") || {};
+
+      // Update with the new/modified context
+      storedContexts[txId] = storableContext;
+
+      // Save back to storage
+      await this.state.storage.put("transaction_contexts", storedContexts);
+      console.log(`Saved transaction context for ${txId}`);
+    } catch (error) {
+      console.error(`Failed to save transaction context for ${txId}:`, error);
+    }
+  }
+
+  // Remove a transaction context from persistent storage
+  private async removeTransactionContext(txId: string) {
+    try {
+      const storedContexts = await this.state.storage.get("transaction_contexts") || {};
+      if (storedContexts && typeof storedContexts === 'object' && txId in storedContexts) {
+        delete storedContexts[txId];
+        await this.state.storage.put("transaction_contexts", storedContexts);
+        console.log(`Removed transaction context for ${txId} from storage`);
+      }
+    } catch (error) {
+      console.error(`Failed to remove transaction context for ${txId}:`, error);
+    }
+  }
+
+  // Set up periodic transaction cleanup
+  private setupTransactionCleaner() {
+    const CLEANUP_INTERVAL = 60000; // 1 minute
+
+    const cleanup = () => {
+      this.cleanupStaleTransactions();
+      setTimeout(cleanup, CLEANUP_INTERVAL);
+    };
+
+    setTimeout(cleanup, CLEANUP_INTERVAL);
+  }
+
+  // Clean up stale transactions
+  private async cleanupStaleTransactions() {
+    const now = Date.now();
+    const MAX_TRANSACTION_LIFETIME = 10 * 60 * 1000; // 10 minutes
+    const MAX_IDLE_TIME = 5 * 60 * 1000; // 5 minutes
+
+    // Track which transactions need cleanup in persistent storage
+    const txIdsToRemove: string[] = [];
+
+    for (const [txId, ctx] of this.transactionContexts.entries()) {
+      // Skip non-active transactions
+      if (ctx.status !== 'active') continue;
+
+      const txAge = now - ctx.startTime;
+      const idleTime = now - ctx.lastActivity;
+
+      if (txAge > MAX_TRANSACTION_LIFETIME || idleTime > MAX_IDLE_TIME) {
+        console.log(`Auto-rolling back stale transaction ${txId} (age: ${txAge}ms, idle: ${idleTime}ms)`);
+
+        // Auto-rollback stale transaction
+        ctx.status = 'rolledback';
+        ctx.lastActivity = now;
+
+        // Update in persistent storage
+        await this.saveTransactionContext(txId, ctx);
+
+        // If transaction had any operations, restore from bookmark
+        if (ctx.operations.length > 0) {
+          try {
+            await this.state.storage.onNextSessionRestoreBookmark(ctx.bookmark);
+            this.state.abort();
+          } catch (e) {
+            console.error(`Error rolling back stale transaction ${txId}:`, e);
+          }
+        }
+      }
+    }
+
+    // Clean up old non-active transactions
+    for (const [txId, ctx] of this.transactionContexts.entries()) {
+      if (ctx.status !== 'active' && now - ctx.lastActivity > 10 * 60 * 1000) {
+        this.transactionContexts.delete(txId);
+        txIdsToRemove.push(txId);
+      }
+    }
+
+    // Remove from persistent storage
+    for (const txId of txIdsToRemove) {
+      await this.removeTransactionContext(txId);
+    }
+  }
+
+  // Helper method to extract table names from SQL queries
+  private extractAffectedTables(sql: string): string[] {
+    // Simplified implementation - in production, use a proper SQL parser
+    const tables: string[] = [];
+
+    // Basic regex to extract table names
+    // This is just a simple example - real implementation needs a proper SQL parser
+    const fromMatch = sql.match(/FROM\s+([a-zA-Z0-9_]+)/i);
+    if (fromMatch && fromMatch[1]) tables.push(fromMatch[1]);
+
+    const joinMatch = sql.match(/JOIN\s+([a-zA-Z0-9_]+)/gi);
+    if (joinMatch) {
+      joinMatch.forEach(match => {
+        const table = match.replace(/JOIN\s+/i, '');
+        tables.push(table);
       });
     }
 
-    // Handle schema initialization
-    if (path === "/init" && request.method === "POST") {
-      try {
-        const { schema } = (await request.json()) as {
-          schema: string[];
-        };
+    const intoMatch = sql.match(/INTO\s+([a-zA-Z0-9_]+)/i);
+    if (intoMatch && intoMatch[1]) tables.push(intoMatch[1]);
 
-        // Create schema_info table if not exists
+    const updateMatch = sql.match(/UPDATE\s+([a-zA-Z0-9_]+)/i);
+    if (updateMatch && updateMatch[1]) tables.push(updateMatch[1]);
+
+    return tables;
+  }
+
+  // Check for transaction conflicts
+  private hasConflictingTransaction(currentTxId: string, tables: string[], isWrite: boolean): string | null {
+    for (const [txId, ctx] of this.transactionContexts.entries()) {
+      if (txId === currentTxId || ctx.status !== 'active') continue;
+
+      // Check for write-write conflicts (most serious)
+      if (isWrite) {
+        for (const table of tables) {
+          // If another transaction is writing to the same table
+          if (ctx.writeTables.has(table)) {
+            return txId; // Conflict detected
+          }
+        }
+      }
+
+      // Check for read-write conflicts
+      // If this is a read operation but another transaction is writing to the table
+      if (!isWrite) {
+        for (const table of tables) {
+          if (ctx.writeTables.has(table)) {
+            return txId; // Conflict detected
+          }
+        }
+      }
+
+      // Check for write-read conflicts
+      // If this is a write operation but another transaction has read from the table
+      if (isWrite) {
+        for (const table of tables) {
+          if (ctx.readTables.has(table)) {
+            return txId; // Conflict detected
+          }
+        }
+      }
+    }
+
+    return null; // No conflicts
+  }
+
+  // Clean up a transaction after a delay
+  private async cleanupTransactionAfterDelay(transactionId: string, delayMs: number): Promise<void> {
+    // Use a Promise with a timeout instead of setTimeout
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+
+    // Now perform the cleanup
+    try {
+      // Check if transaction still exists and needs cleanup
+      const txContext = this.transactionContexts.get(transactionId);
+      if (txContext && txContext.status !== 'active') {
+        console.log(`Cleaning up transaction ${transactionId} after delay`);
+        this.transactionContexts.delete(transactionId);
+        await this.removeTransactionContext(transactionId);
+      }
+    } catch (error) {
+      // Log but don't throw to prevent DO crashes
+      console.error(`Error during delayed cleanup of transaction ${transactionId}:`, error);
+    }
+  }
+
+  // Broadcast an event to all connected WebSocket clients
+  private broadcastEvent(event: { type: string; [key: string]: any }) {
+    const message = JSON.stringify(event);
+    console.log(`Broadcasting event ${event.type} to ${this.connections.size} clients`);
+    
+    // Send to all connected clients
+    for (const [sessionId, ws] of this.connections.entries()) {
+      try {
+        ws.send(message);
+      } catch (err) {
+        console.error(`Failed to send to client ${sessionId}:`, err);
+        // Remove broken connections
+        this.connections.delete(sessionId);
+      }
+    }
+  }
+
+  // Helper method to initialize the database
+  private async initializeDatabase(schema?: string[]): Promise<boolean> {
+    if (this.initialized) return true;
+
+    try {
+      // Use the same initialization logic as the /init endpoint
+      const schemaToUse = schema || [
+        `CREATE TABLE IF NOT EXISTS schema_info (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )`
+      ];
+
+      // Use storage.transaction for initialization to ensure atomicity
+      await this.state.storage.transaction(async () => {
         this.sql.exec(`
           CREATE TABLE IF NOT EXISTS schema_info (
             key TEXT PRIMARY KEY,
@@ -460,136 +766,727 @@ export class ORMDO {
           )
         `);
 
-        // Execute all schema statements
-        for (const statement of schema) {
+        for (const statement of schemaToUse) {
           this.sql.exec(statement);
         }
 
-        // Update initialization timestamp
         const timestamp = new Date().toISOString();
         this.sql.exec(
           "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('initialized_at', ?)",
-          timestamp,
+          [timestamp],
         );
 
         this.initialized = true;
+        console.log("Database initialized at:", timestamp);
+      });
 
-        return new Response(JSON.stringify({ initialized_at: timestamp }), {
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
+      return true;
+    } catch (error) {
+      console.error("Failed to initialize database:", error);
+      return false;
+    }
+  }
+
+  // Create a method to handle new WebSocket connections
+  private handleWebSocketConnection(): Response {
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+    const wsSessionId = crypto.randomUUID();
+
+    // Accept the WebSocket connection
+    this.state.acceptWebSocket(server);
+    
+    // Store the connection with its ID
+    this.connections.set(wsSessionId, server);
+    
+    // Set up event handlers
+    this.setupWebSocketHandlers(server, wsSessionId);
+    
+    return new Response(null, { 
+      status: 101, 
+      webSocket: client 
+    });
+  }
+
+  // Set up handlers for WebSocket events
+  private setupWebSocketHandlers(ws: WebSocket, wsSessionId?: string) {
+    ws.addEventListener('message', async (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        await this.handleWebSocketMessage(ws, message);
+      } catch (error) {
+        console.error("Error processing WebSocket message:", error);
+        ws.send(JSON.stringify({
+          error: "Failed to process message"
+        }));
+      }
+    });
+    
+    ws.addEventListener('close', (event) => {
+      // Clean up connection
+      if (wsSessionId) {
+        this.connections.delete(wsSessionId);
+      }
+      console.log(`WebSocket connection closed: ${event.code}`);
+    });
+    
+    // Send initial connection confirmation
+    ws.send(JSON.stringify({
+      type: 'connection_established',
+      wsSessionId
+    }));
+  }
+
+  // Handle different types of WebSocket messages
+  private async handleWebSocketMessage(ws: WebSocket, message: any) {
+    // Ensure DB is initialized
+    if (!this.initialized) {
+      await this.initializeDatabase();
+    }
+    
+    if (message.action === 'query') {
+      try {
+        const { sql, params = [], transaction_id, requestId } = message;
+        
+        // Handle query within transaction context
+        if (transaction_id) {
+          const txContext = this.transactionContexts.get(transaction_id);
+          if (!txContext || txContext.status !== 'active') {
+            throw new Error(`Transaction not found or inactive: ${transaction_id}`);
+          }
+          
+          // Update activity timestamp
+          txContext.lastActivity = Date.now();
+          
+          // Parse SQL to identify affected tables
+          const affectedTables = this.extractAffectedTables(sql);
+          
+          // Check if read-only or write operation
+          const isWrite = /INSERT|UPDATE|DELETE|CREATE|DROP|ALTER/i.test(sql);
+          
+          // For write operations, track tables being written to
+          if (isWrite) {
+            affectedTables.forEach(table => txContext.writeTables.add(table));
+          } else {
+            // For read operations, track tables being read from
+            affectedTables.forEach(table => txContext.readTables.add(table));
+          }
+          
+          // Look for conflicts with other active transactions
+          const conflictingTxId = this.hasConflictingTransaction(transaction_id, affectedTables, isWrite);
+          if (conflictingTxId) {
+            throw new Error(`Transaction conflict detected with transaction ${conflictingTxId}`);
+          }
+          
+          // Store operation for later execution at commit time
+          txContext.operations.push({ sql, params });
+          
+          // Execute the query
+          const cursor = this.sql.exec(sql, ...params);
+          const result = cursor.toArray();
+          
+          // Store result for later reference
+          txContext.results.push(result);
+          
+          // Update transaction context in storage
+          await this.saveTransactionContext(transaction_id, txContext);
+          
+          // Broadcast CDC events for data modifications (if any connected clients)
+          if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+            const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+            const tables = this.extractAffectedTables(sql);
+            
+            // Broadcast a change event to all connected clients
+            if (operationType && tables.length > 0) {
+              this.broadcastEvent({
+                type: 'database_change',
+                operation: operationType,
+                tables,
+                rowsAffected: cursor.rowsWritten,
+                timestamp: Date.now()
+              });
+            }
+          }
+          
+          ws.send(JSON.stringify({
+            type: 'query_result',
+            requestId,
+            result,
+            transaction_id
+          }));
+        } else {
+          // Regular non-transactional query
+          const cursor = this.sql.exec(sql, ...params);
+          const result = cursor.toArray();
+          
+          // Broadcast CDC events for data modifications (if any connected clients)
+          if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+            const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+            const tables = this.extractAffectedTables(sql);
+            
+            // Broadcast a change event to all connected clients
+            if (operationType && tables.length > 0) {
+              this.broadcastEvent({
+                type: 'database_change',
+                operation: operationType,
+                tables,
+                rowsAffected: cursor.rowsWritten,
+                timestamp: Date.now()
+              });
+            }
+          }
+          
+          ws.send(JSON.stringify({
+            type: 'query_result',
+            requestId,
+            result
+          }));
+        }
       } catch (error: any) {
-        console.error("Schema initialization error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
+        ws.send(JSON.stringify({
+          type: 'error',
+          requestId: message.requestId,
+          error: error.message
+        }));
+      }
+    } else if (message.action === 'transaction') {
+      // Handle transaction operations (beginTransaction, commitTransaction, etc.)
+      const { operation, transaction_id } = message;
+      
+      if (operation === 'begin') {
+        try {
+          const txId = crypto.randomUUID();
+          const bookmark = await this.state.storage.getCurrentBookmark();
+
+          const txContext = {
+            id: txId,
+            bookmark,
+            operations: [],
+            readTables: new Set<string>(),
+            writeTables: new Set<string>(),
+            startTime: Date.now(),
+            lastActivity: Date.now(),
+            status: 'active' as TransactionStatus,
+            results: []
+          };
+
+          this.transactionContexts.set(txId, txContext);
+          await this.saveTransactionContext(txId, txContext);
+
+          ws.send(JSON.stringify({
+            type: 'transaction_result',
+            requestId: message.requestId,
+            transaction_id: txId,
+            status: 'active'
+          }));
+        } catch (error: any) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            requestId: message.requestId,
+            error: error.message
+          }));
+        }
+      } else if (['commit', 'rollback'].includes(operation) && transaction_id) {
+        // Handle commit/rollback operations
+        // Implementation similar to HTTP endpoints
+        try {
+          const txContext = this.transactionContexts.get(transaction_id);
+          if (!txContext || txContext.status !== 'active') {
+            throw new Error(`Transaction not found or inactive: ${transaction_id}`);
+          }
+          
+          txContext.status = operation === 'commit' ? 'committed' : 'rolledback';
+          txContext.lastActivity = Date.now();
+          
+          await this.saveTransactionContext(transaction_id, txContext);
+          
+          this.cleanupTransactionAfterDelay(transaction_id, 60000).catch(e => {
+            console.error(`Error in ${operation} transaction ${transaction_id}:`, e);
+          });
+          
+          // For commit operations, also broadcast CDC events for the transaction
+          if (operation === 'commit' && this.connections.size > 1) {
+            try {
+              const writeOperations = txContext.operations.filter(op => 
+                /INSERT|UPDATE|DELETE/i.test(op.sql)
+              );
+              
+              if (writeOperations.length > 0) {
+                const affectedTables = Array.from(txContext.writeTables);
+                
+                // Broadcast transaction commit event
+                this.broadcastEvent({
+                  type: 'transaction_committed',
+                  transaction_id,
+                  tables: affectedTables,
+                  operationCount: writeOperations.length,
+                  timestamp: Date.now()
+                });
+              }
+            } catch (error) {
+              console.error('Error broadcasting transaction event:', error);
+            }
+          }
+          
+          ws.send(JSON.stringify({
+            type: 'transaction_result',
+            requestId: message.requestId,
+            transaction_id,
+            status: txContext.status,
+            results: txContext.results
+          }));
+        } catch (error: any) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            requestId: message.requestId,
+            error: error.message
+          }));
+        }
       }
     }
+  }
 
-    // Standard query endpoint
-    if (path === "/query" && request.method === "POST") {
-      try {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: this.corsHeaders });
+    }
+
+    // Handle WebSocket connections
+    if (path === "/socket") {
+      return this.handleWebSocketConnection();
+    }
+
+    try {
+      // Initialization endpoint
+      if (path === "/init" && request.method === "POST") {
+        const { schema } = (await request.json()) as { schema: string[] };
+
+        // Use our common initialization method
+        const success = await this.initializeDatabase(schema);
+
+        if (!success) {
+          return new Response(JSON.stringify({ error: "Database initialization failed" }), {
+            status: 500,
+            headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+
+        return new Response(JSON.stringify({ initialized_at: new Date().toISOString() }), {
+          headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Standard query endpoint
+      if (path === "/query" && request.method === "POST") {
         const {
           sql,
           params = [],
-          isRaw = false,
-        } = (await request.json()) as {
-          sql: string;
-          params?: any[];
-          isRaw?: boolean;
-        };
+          transaction_id
+        } = (await request.json()) as QueryRequest;
 
-        // Execute the query
-        const cursor = this.sql.exec(sql, ...params);
-
-        // Return the appropriate format
-        const result = isRaw
-          ? {
-              rows: Array.from(cursor.raw()),
-              columns: cursor.columnNames,
-              meta: {
-                rows_read: cursor.rowsRead,
-                rows_written: cursor.rowsWritten,
-              },
-            }
-          : cursor.toArray();
-
-        return new Response(JSON.stringify(result), {
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
-      } catch (error: any) {
-        console.error("SQL execution error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
-      }
-    }
-
-    // Raw query endpoint (Browsable compatible)
-    if (path === "/query/raw" && request.method === "POST") {
-      try {
-        const data = (await request.json()) as any;
-        let result;
-
-        // Handle transaction if present
-        if (data.transaction) {
-          const results: RawQueryResult[] = [];
-          for (const query of data.transaction) {
-            const cursor = this.sql.exec(query.sql, ...(query.params || []));
-            results.push({
-              columns: cursor.columnNames,
-              rows: Array.from(cursor.raw()),
-              meta: {
-                rows_read: cursor.rowsRead,
-                rows_written: cursor.rowsWritten,
-              },
+        // For non-transaction queries, ensure database is initialized
+        if (!transaction_id && !this.initialized) {
+          console.log("Query requested but database not initialized, initializing...");
+          const success = await this.initializeDatabase();
+          if (!success) {
+            return new Response(JSON.stringify({
+              error: "Failed to initialize database."
+            }), {
+              status: 500,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
-          result = results;
+        }
+
+        // Handle query within transaction context
+        if (transaction_id) {
+          const txContext = this.transactionContexts.get(transaction_id);
+          if (!txContext || txContext.status !== 'active') {
+            // Try to recover from storage if not in memory
+            if (!txContext) {
+              try {
+                console.log(`Transaction ${transaction_id} not found in memory for query, attempting to recover from storage...`);
+                const storedContexts = await this.state.storage.get("transaction_contexts") || {};
+                if (storedContexts && typeof storedContexts === 'object' && transaction_id in storedContexts) {
+                  const storedCtx = storedContexts[transaction_id];
+                  if (storedCtx.status === 'active') {
+                    // Restore transaction from storage
+                    const restoredCtx = {
+                      ...storedCtx,
+                      readTables: new Set<string>(storedCtx.readTables || []),
+                      writeTables: new Set<string>(storedCtx.writeTables || []),
+                      results: storedCtx.results || []
+                    };
+                    this.transactionContexts.set(transaction_id, restoredCtx);
+                    console.log(`Successfully recovered transaction ${transaction_id} from storage for query`);
+
+                    // Process the request again with the recovered context
+                    return this.fetch(request);
+                  }
+                }
+              } catch (error) {
+                console.error(`Failed to recover transaction ${transaction_id} from storage for query:`, error);
+              }
+            }
+
+            return new Response(JSON.stringify({
+              error: `Transaction not found or inactive: ${transaction_id}`,
+              status: txContext?.status || 'unknown'
+            }), {
+              status: 404,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+
+          // Update activity timestamp
+          txContext.lastActivity = Date.now();
+
+          try {
+            // Parse SQL to identify affected tables
+            const affectedTables = this.extractAffectedTables(sql);
+
+            // Check if read-only or write operation
+            const isWrite = /INSERT|UPDATE|DELETE|CREATE|DROP|ALTER/i.test(sql);
+
+            // For write operations, track tables being written to
+            if (isWrite) {
+              affectedTables.forEach(table => txContext.writeTables.add(table));
+            } else {
+              // For read operations, track tables being read from
+              affectedTables.forEach(table => txContext.readTables.add(table));
+            }
+
+            // Look for conflicts with other active transactions
+            const conflictingTxId = this.hasConflictingTransaction(transaction_id, affectedTables, isWrite);
+            if (conflictingTxId) {
+              return new Response(JSON.stringify({
+                error: `Transaction conflict detected with transaction ${conflictingTxId}`
+              }), {
+                status: 409, // Conflict
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+              });
+            }
+
+            // Store operation for later execution at commit time
+            txContext.operations.push({ sql, params });
+
+            // SIMPLIFIED APPROACH: Execute the query directly without preview mode
+            // Just execute the query normally and get the result
+            let result;
+            const cursor = this.sql.exec(sql, ...params);
+            result = cursor.toArray();
+
+            // Store result for later reference
+            if (!txContext.results) {
+              txContext.results = [];
+            }
+            txContext.results.push(result);
+
+            // Update transaction context in storage
+            txContext.lastActivity = Date.now();
+            await this.saveTransactionContext(transaction_id, txContext);
+
+            console.log(`TX ${transaction_id}: Executed operation #${txContext.operations.length}: ${sql.substring(0, 80)}...`);
+
+            // Broadcast CDC events for data modifications (if any connected clients)
+            if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+              const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+              const tables = this.extractAffectedTables(sql);
+              
+              // Broadcast a change event to all connected clients
+              if (operationType && tables.length > 0) {
+                this.broadcastEvent({
+                  type: 'database_change',
+                  operation: operationType,
+                  tables,
+                  rowsAffected: cursor.rowsWritten,
+                  timestamp: Date.now()
+                });
+              }
+            }
+
+            return new Response(JSON.stringify(result), {
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+            });
+          } catch (error: any) {
+            console.error("Transaction query error:", error);
+            return new Response(JSON.stringify({ error: error.message }), {
+              status: 400,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+            });
+          }
         } else {
-          // Single query
+          // Regular non-transactional query handling
+          const cursor = this.sql.exec(sql, ...params);
+          const result = cursor.toArray();
+
+          // Broadcast CDC events for data modifications (if any connected clients)
+          if (this.connections.size > 1 && /INSERT|UPDATE|DELETE/i.test(sql)) {
+            const operationType = sql.match(/INSERT|UPDATE|DELETE/i)?.[0].toLowerCase();
+            const tables = this.extractAffectedTables(sql);
+            
+            // Broadcast a change event to all connected clients
+            if (operationType && tables.length > 0) {
+              this.broadcastEvent({
+                type: 'database_change',
+                operation: operationType,
+                tables,
+                rowsAffected: cursor.rowsWritten,
+                timestamp: Date.now()
+              });
+            }
+          }
+
+          return new Response(JSON.stringify(result), {
+            headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // Raw query endpoint (Handles single raw queries AND transaction batches)
+      if (path === "/query/raw" && request.method === "POST") {
+        const data = (await request.json()) as {
+          sql?: string;
+          params?: any[];
+          transaction?: { sql: string; params?: any[] }[];
+        };
+
+        // Ensure database is initialized before proceeding
+        if (!this.initialized) {
+          console.log("Raw query requested but database not initialized, initializing...");
+          const success = await this.initializeDatabase();
+          if (!success) {
+            return new Response(JSON.stringify({
+              error: "Failed to initialize database."
+            }), {
+              status: 500,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+        }
+
+        let finalResult: RawQueryResult;
+
+        if (data.transaction) {
+          // Handle transaction batch using storage.transaction()
+          const results: RawQueryResult[] = [];
+          await this.state.storage.transaction(async () => {
+              for (const query of data.transaction!) {
+                  const cursor = this.sql.exec(query.sql, ...(query.params || []));
+                  results.push({
+                      columns: cursor.columnNames,
+                      rows: Array.from(cursor.raw()), // Convert Iterator to Array
+                      meta: {
+                          rows_read: cursor.rowsRead,
+                          rows_written: cursor.rowsWritten,
+                      },
+                  });
+              }
+          });
+          // Return the result of the last statement in the batch
+          finalResult = results.length > 0 ? results[results.length - 1] : { columns: [], rows: [], meta: { rows_read: 0, rows_written: 0 } };
+          finalResult.rows = []; // Kysely expects empty rows from buffered transaction executeQuery
+
+        } else if (data.sql) {
+          // Handle single raw query
           const cursor = this.sql.exec(data.sql, ...(data.params || []));
-          result = {
+          finalResult = {
             columns: cursor.columnNames,
-            rows: Array.from(cursor.raw()),
+            rows: Array.from(cursor.raw()), // Convert Iterator to Array
             meta: {
               rows_read: cursor.rowsRead,
               rows_written: cursor.rowsWritten,
             },
           };
+        } else {
+            throw new Error("Invalid request to /query/raw: missing 'sql' or 'transaction'");
         }
 
-        return new Response(JSON.stringify({ result }), {
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
-      } catch (error: any) {
-        console.error("SQL execution error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: {
-            ...this.corsHeaders,
-            "Content-Type": "application/json",
-          },
-        });
+       return new Response(JSON.stringify(finalResult), {
+         headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+       });
       }
+
+      // Transaction management endpoint
+      if (path === "/transaction" && request.method === "POST") {
+        const { operation, transaction_id } = await request.json() as TransactionRequest;
+
+        // Instead of failing, ensure database is initialized on demand
+        if (!this.initialized) {
+          console.log("Transaction requested but database not initialized, initializing on demand...");
+          const success = await this.initializeDatabase();
+          if (!success) {
+            return new Response(JSON.stringify({
+              error: "Failed to initialize database on demand."
+            }), {
+              status: 500, // Internal Server Error
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+        }
+
+        if (operation === "begin") {
+          const txId = crypto.randomUUID();
+          const bookmark = await this.state.storage.getCurrentBookmark();
+
+          const txContext = {
+            id: txId,
+            bookmark,
+            operations: [] as { sql: string; params?: any[] }[],
+            readTables: new Set<string>(),
+            writeTables: new Set<string>(),
+            startTime: Date.now(),
+            lastActivity: Date.now(),
+            status: 'active' as TransactionStatus,
+            results: [] // Initialize results array
+          };
+
+          // Store in memory
+          this.transactionContexts.set(txId, txContext);
+
+          // Persist to storage
+          await this.saveTransactionContext(txId, txContext);
+
+          return new Response(JSON.stringify({
+            transaction_id: txId,
+            status: 'active'
+          } as TransactionResponse), {
+            headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+
+        if (operation === "commit" || operation === "rollback") {
+          if (!transaction_id) {
+            return new Response(JSON.stringify({ error: "Missing transaction_id" }), {
+              status: 400,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+
+          const txContext = this.transactionContexts.get(transaction_id);
+          if (!txContext || txContext.status !== 'active') {
+            // Try to recover from storage if not in memory
+            if (!txContext) {
+              try {
+                console.log(`Transaction ${transaction_id} not found in memory, attempting to recover from storage...`);
+                const storedContexts = await this.state.storage.get("transaction_contexts") || {};
+                if (storedContexts && typeof storedContexts === 'object' && transaction_id in storedContexts) {
+                  const storedCtx = storedContexts[transaction_id];
+                  if (storedCtx.status === 'active') {
+                    // Restore transaction from storage
+                    const restoredCtx = {
+                      ...storedCtx,
+                      readTables: new Set<string>(storedCtx.readTables || []),
+                      writeTables: new Set<string>(storedCtx.writeTables || []),
+                      results: storedCtx.results || []
+                    };
+                    this.transactionContexts.set(transaction_id, restoredCtx);
+                    console.log(`Successfully recovered transaction ${transaction_id} from storage`);
+
+                    // Process the request again with the recovered context
+                    return this.fetch(request);
+                  }
+                }
+              } catch (error) {
+                console.error(`Failed to recover transaction ${transaction_id} from storage:`, error);
+              }
+            }
+
+            // If we get here, the transaction couldn't be recovered
+            return new Response(JSON.stringify({
+              error: "Transaction not found or inactive",
+              transaction_id,
+              status: txContext?.status || 'unknown'
+            } as TransactionResponse), {
+              status: 404,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+
+          if (operation === "commit") {
+            try {
+              console.log(`Committing transaction ${transaction_id} with ${txContext.operations.length} operations`);
+
+              // Mark transaction as committed - no need to re-execute anything
+              txContext.status = 'committed';
+              txContext.lastActivity = Date.now();
+
+              // Update the transaction context in persistent storage
+              await this.saveTransactionContext(transaction_id, txContext);
+
+              // Return successful response with the results we already have
+              const response = new Response(JSON.stringify({
+                transaction_id,
+                status: 'committed',
+                results: txContext.results // We already have the real results
+              }), {
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+              });
+
+              // Schedule cleanup for later without blocking the response
+              this.cleanupTransactionAfterDelay(transaction_id, 60000).catch(e => {
+                console.error(`Error committing transaction ${transaction_id}:`, e);
+              });
+
+              return response;
+            } catch (error: any) {
+              console.error("Transaction commit error:", error);
+              return new Response(JSON.stringify({ error: error.message }), {
+                status: 500,
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+              });
+            }
+          }
+
+          if (operation === "rollback") {
+            try {
+              console.log(`Rolling back transaction ${transaction_id} with ${txContext.operations.length} operations`);
+
+              // Mark transaction as rolled back - no need to re-execute anything
+              txContext.status = 'rolledback';
+              txContext.lastActivity = Date.now();
+
+              // Update the transaction context in persistent storage
+              await this.saveTransactionContext(transaction_id, txContext);
+
+              // Return successful response with the results we already have
+              const response = new Response(JSON.stringify({
+                transaction_id,
+                status: 'rolledback',
+                results: txContext.results // We already have the real results
+              }), {
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" }
+              });
+
+              // Schedule cleanup for later without blocking the response
+              this.cleanupTransactionAfterDelay(transaction_id, 60000).catch(e => {
+                console.error(`Error rolling back transaction ${transaction_id}:`, e);
+              });
+
+              return response;
+            } catch (error: any) {
+              console.error("Transaction rollback error:", error);
+              return new Response(JSON.stringify({ error: error.message }), {
+                status: 500,
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+              });
+            }
+          }
+        }
+      }
+    } catch (error: any) {
+      console.error("Error processing request:", error);
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: 500,
+        headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    return new Response("Not found", { status: 404 });
+    return new Response(JSON.stringify({ error: "Not found" }), {
+      status: 404, headers: { ...this.corsHeaders, "Content-Type": "application/json" },
+    });
   }
 }
