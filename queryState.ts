@@ -1,10 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 //@ts-check
 
-// Remove direct import as Transaction should be global via reference
-// import type { SqlStorage, SqlStorageTransaction, SqlStorageCursor } from "@cloudflare/workers-types";
-
-// Basic configuration for the factory
 export interface DBConfig {
   version?: string; // Version prefix for DO naming
   schema: string | string[]; // SQL statements to initialize schema
@@ -17,7 +13,6 @@ export interface MiddlewareOptions {
   prefix?: string; // URL path prefix for API endpoints
 }
 
-// Query options for individual queries
 interface QueryOptions {
   isRaw?: boolean;
   isTransaction?: boolean; // Re-added for internal batching
@@ -153,7 +148,7 @@ export function createDBClient<T extends DBConfig>(
   async function query<O extends QueryOptions>(
     options: O,
     // Can be SQL string or the transaction batch array
-    sqlOrTransaction: string | { sql: string; params?: any[] }[], 
+    sqlOrTransaction: string | { sql: string; params?: any[] }[],
     params: any[] = [], // Only used when sqlOrTransaction is string
   ): Promise<QueryResult<QueryResponseType<O>>> {
     if (!await ensureInitialized()) {
@@ -167,7 +162,7 @@ export function createDBClient<T extends DBConfig>(
       // Transaction Batch (from Kysely commit)
       body = { transaction: sqlOrTransaction };
       // Batched transactions MUST go to the raw endpoint
-      endpoint = "/query/raw"; 
+      endpoint = "/query/raw";
     } else if (typeof sqlOrTransaction === 'string') {
       // Single Query
       body = {
@@ -182,14 +177,11 @@ export function createDBClient<T extends DBConfig>(
 
     const result = await sendToDoRequest<QueryResponseType<O>>(endpoint, body);
 
-    // If the DO returns results within a { result: ... } structure (like /query/raw did),
-    // extract the actual result. Otherwise, return the direct JSON.
-    // Adjust this based on the actual DO response format for consistency.
     if (options.isRaw && result.json && typeof result.json === 'object' && 'result' in result.json) {
         return {
             ...result,
             // @ts-ignore
-            json: result.json.result as QueryResponseType<O> 
+            json: result.json.result as QueryResponseType<O>
         };
     }
 
@@ -219,18 +211,18 @@ export function createDBClient<T extends DBConfig>(
   // Reintroduce transactionQuery for batching from Kysely commit
   async function transactionQuery<TRes = Record<string, any>>(
       transaction: { sql: string; params?: any[] }[],
-  ): Promise<QueryResult<RawQueryResult>> { 
+  ): Promise<QueryResult<RawQueryResult>> {
       // Send the batch. isRaw needs to be true because the DO endpoint is /query/raw
       // isTransaction needs to be true to trigger the batch format in `query`
       // The actual result type (ArrayQueryResult) depends on the DO's response for batches.
       // Assuming /query/raw with a batch returns results compatible with ArrayQueryResult.
       // If it returns multiple RawQueryResult, this cast needs adjustment.
       return query<QueryOptions & { isRaw: true, isTransaction: true }>(
-          { isRaw: true, isTransaction: true }, 
+          { isRaw: true, isTransaction: true },
           transaction // Pass the batch array
       );
   }
-  
+
   // --- Middleware Function (Largely unchanged) ---
   async function middleware(
     request: Request,
@@ -272,7 +264,7 @@ export function createDBClient<T extends DBConfig>(
 
     if ((subPath === "/query" || subPath === "/query/raw") && request.method === "POST") {
       try {
-        const body = await request.json() as { sql: string; params?: any[] }; 
+        const body = await request.json() as { sql: string; params?: any[] };
         if (!body.sql) {
              return new Response(JSON.stringify({ error: "Missing 'sql' property in request body" }), {
                 status: 400, headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
@@ -303,21 +295,21 @@ export function createDBClient<T extends DBConfig>(
     rawQuery,
     transactionQuery, // Expose batch query method
     middleware,
-    
+
     // Skeleton implementations for transaction methods
     beginTransaction: async () => {
       return sendToDoRequest<TransactionResponse>('/transaction', { operation: 'begin' });
     },
     commitTransaction: async (transactionId: string) => {
-      return sendToDoRequest<TransactionResponse>('/transaction', { 
-        operation: 'commit', 
-        transaction_id: transactionId 
+      return sendToDoRequest<TransactionResponse>('/transaction', {
+        operation: 'commit',
+        transaction_id: transactionId
       });
     },
     rollbackTransaction: async (transactionId: string) => {
-      return sendToDoRequest<TransactionResponse>('/transaction', { 
-        operation: 'rollback', 
-        transaction_id: transactionId 
+      return sendToDoRequest<TransactionResponse>('/transaction', {
+        operation: 'rollback',
+        transaction_id: transactionId
       });
     },
     queryWithTransaction: async <T = Record<string, any>>(
@@ -352,7 +344,7 @@ export type DBClient = {
     request: Request,
     options?: MiddlewareOptions,
   ) => Promise<Response | undefined>;
-  
+
   // Interactive transaction methods
   beginTransaction: () => Promise<QueryResult<TransactionResponse>>;
   commitTransaction: (transactionId: string) => Promise<QueryResult<TransactionResponse>>;
@@ -364,10 +356,10 @@ export type DBClient = {
   ) => Promise<QueryResult<ArrayQueryResult<T>>>;
 };
 
-// Durable Object implementation 
+// Durable Object implementation
 export class ORMDO {
   private state: DurableObjectState;
-  public sql: SqlStorage; 
+  public sql: SqlStorage;
   private initialized: boolean = false;
 
   private corsHeaders = getCorsHeaders();
@@ -389,10 +381,10 @@ export class ORMDO {
     this.state = state;
     this.sql = state.storage.sql;
     this.state.storage.get("initialized_at").then(val => { this.initialized = !!val; });
-    
+
     // Load transaction contexts from storage
     this.loadTransactionContexts();
-    
+
     // Set up periodic cleanup of stale transactions
     this.setupTransactionCleaner();
   }
@@ -417,7 +409,7 @@ export class ORMDO {
       console.error("Failed to load transaction contexts:", error);
     }
   }
-  
+
   // Save transaction contexts to persistent storage
   private async saveTransactionContext(txId: string, context: any) {
     try {
@@ -428,13 +420,13 @@ export class ORMDO {
         writeTables: Array.from(context.writeTables || []),
         results: context.results || []
       };
-      
+
       // Get current contexts
       const storedContexts = await this.state.storage.get("transaction_contexts") || {};
-      
+
       // Update with the new/modified context
       storedContexts[txId] = storableContext;
-      
+
       // Save back to storage
       await this.state.storage.put("transaction_contexts", storedContexts);
       console.log(`Saved transaction context for ${txId}`);
@@ -442,7 +434,7 @@ export class ORMDO {
       console.error(`Failed to save transaction context for ${txId}:`, error);
     }
   }
-  
+
   // Remove a transaction context from persistent storage
   private async removeTransactionContext(txId: string) {
     try {
@@ -460,12 +452,12 @@ export class ORMDO {
   // Set up periodic transaction cleanup
   private setupTransactionCleaner() {
     const CLEANUP_INTERVAL = 60000; // 1 minute
-    
+
     const cleanup = () => {
       this.cleanupStaleTransactions();
       setTimeout(cleanup, CLEANUP_INTERVAL);
     };
-    
+
     setTimeout(cleanup, CLEANUP_INTERVAL);
   }
 
@@ -474,27 +466,27 @@ export class ORMDO {
     const now = Date.now();
     const MAX_TRANSACTION_LIFETIME = 10 * 60 * 1000; // 10 minutes
     const MAX_IDLE_TIME = 5 * 60 * 1000; // 5 minutes
-    
+
     // Track which transactions need cleanup in persistent storage
     const txIdsToRemove: string[] = [];
-    
+
     for (const [txId, ctx] of this.transactionContexts.entries()) {
       // Skip non-active transactions
       if (ctx.status !== 'active') continue;
-      
+
       const txAge = now - ctx.startTime;
       const idleTime = now - ctx.lastActivity;
-      
+
       if (txAge > MAX_TRANSACTION_LIFETIME || idleTime > MAX_IDLE_TIME) {
         console.log(`Auto-rolling back stale transaction ${txId} (age: ${txAge}ms, idle: ${idleTime}ms)`);
-        
+
         // Auto-rollback stale transaction
         ctx.status = 'rolledback';
         ctx.lastActivity = now;
-        
+
         // Update in persistent storage
         await this.saveTransactionContext(txId, ctx);
-        
+
         // If transaction had any operations, restore from bookmark
         if (ctx.operations.length > 0) {
           try {
@@ -506,7 +498,7 @@ export class ORMDO {
         }
       }
     }
-    
+
     // Clean up old non-active transactions
     for (const [txId, ctx] of this.transactionContexts.entries()) {
       if (ctx.status !== 'active' && now - ctx.lastActivity > 10 * 60 * 1000) {
@@ -514,7 +506,7 @@ export class ORMDO {
         txIdsToRemove.push(txId);
       }
     }
-    
+
     // Remove from persistent storage
     for (const txId of txIdsToRemove) {
       await this.removeTransactionContext(txId);
@@ -525,12 +517,12 @@ export class ORMDO {
   private extractAffectedTables(sql: string): string[] {
     // Simplified implementation - in production, use a proper SQL parser
     const tables: string[] = [];
-    
+
     // Basic regex to extract table names
     // This is just a simple example - real implementation needs a proper SQL parser
     const fromMatch = sql.match(/FROM\s+([a-zA-Z0-9_]+)/i);
     if (fromMatch && fromMatch[1]) tables.push(fromMatch[1]);
-    
+
     const joinMatch = sql.match(/JOIN\s+([a-zA-Z0-9_]+)/gi);
     if (joinMatch) {
       joinMatch.forEach(match => {
@@ -538,13 +530,13 @@ export class ORMDO {
         tables.push(table);
       });
     }
-    
+
     const intoMatch = sql.match(/INTO\s+([a-zA-Z0-9_]+)/i);
     if (intoMatch && intoMatch[1]) tables.push(intoMatch[1]);
-    
+
     const updateMatch = sql.match(/UPDATE\s+([a-zA-Z0-9_]+)/i);
     if (updateMatch && updateMatch[1]) tables.push(updateMatch[1]);
-    
+
     return tables;
   }
 
@@ -552,7 +544,7 @@ export class ORMDO {
   private hasConflictingTransaction(currentTxId: string, tables: string[], isWrite: boolean): string | null {
     for (const [txId, ctx] of this.transactionContexts.entries()) {
       if (txId === currentTxId || ctx.status !== 'active') continue;
-      
+
       // Check for write-write conflicts (most serious)
       if (isWrite) {
         for (const table of tables) {
@@ -562,7 +554,7 @@ export class ORMDO {
           }
         }
       }
-      
+
       // Check for read-write conflicts
       // If this is a read operation but another transaction is writing to the table
       if (!isWrite) {
@@ -572,7 +564,7 @@ export class ORMDO {
           }
         }
       }
-      
+
       // Check for write-read conflicts
       // If this is a write operation but another transaction has read from the table
       if (isWrite) {
@@ -583,7 +575,7 @@ export class ORMDO {
         }
       }
     }
-    
+
     return null; // No conflicts
   }
 
@@ -591,7 +583,7 @@ export class ORMDO {
   private async cleanupTransactionAfterDelay(transactionId: string, delayMs: number): Promise<void> {
     // Use a Promise with a timeout instead of setTimeout
     await new Promise(resolve => setTimeout(resolve, delayMs));
-    
+
     // Now perform the cleanup
     try {
       // Check if transaction still exists and needs cleanup
@@ -610,7 +602,7 @@ export class ORMDO {
   // Helper method to initialize the database
   private async initializeDatabase(schema?: string[]): Promise<boolean> {
     if (this.initialized) return true;
-    
+
     try {
       // Use the same initialization logic as the /init endpoint
       const schemaToUse = schema || [
@@ -619,30 +611,30 @@ export class ORMDO {
           value TEXT
         )`
       ];
-      
+
       // Use storage.transaction for initialization to ensure atomicity
-      await this.state.storage.transaction(async () => { 
-        await this.sql.exec(`
+      await this.state.storage.transaction(async () => {
+        this.sql.exec(`
           CREATE TABLE IF NOT EXISTS schema_info (
             key TEXT PRIMARY KEY,
             value TEXT
           )
-        `); 
-        
+        `);
+
         for (const statement of schemaToUse) {
-          await this.sql.exec(statement);
+          this.sql.exec(statement);
         }
-        
+
         const timestamp = new Date().toISOString();
-        await this.sql.exec(
+        this.sql.exec(
           "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('initialized_at', ?)",
           [timestamp],
         );
-        
+
         this.initialized = true;
         console.log("Database initialized at:", timestamp);
       });
-      
+
       return true;
     } catch (error) {
       console.error("Failed to initialize database:", error);
@@ -662,22 +654,22 @@ export class ORMDO {
       // Initialization endpoint
       if (path === "/init" && request.method === "POST") {
         const { schema } = (await request.json()) as { schema: string[] };
-        
+
         // Use our common initialization method
         const success = await this.initializeDatabase(schema);
-        
+
         if (!success) {
-          return new Response(JSON.stringify({ error: "Database initialization failed" }), { 
-            status: 500, 
-            headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+          return new Response(JSON.stringify({ error: "Database initialization failed" }), {
+            status: 500,
+            headers: { ...this.corsHeaders, "Content-Type": "application/json" }
           });
         }
-        
-        return new Response(JSON.stringify({ initialized_at: new Date().toISOString() }), { 
+
+        return new Response(JSON.stringify({ initialized_at: new Date().toISOString() }), {
           headers: { ...this.corsHeaders, "Content-Type": "application/json" },
         });
       }
-      
+
       // Standard query endpoint
       if (path === "/query" && request.method === "POST") {
         const {
@@ -685,21 +677,21 @@ export class ORMDO {
           params = [],
           transaction_id
         } = (await request.json()) as QueryRequest;
-        
+
         // For non-transaction queries, ensure database is initialized
         if (!transaction_id && !this.initialized) {
           console.log("Query requested but database not initialized, initializing...");
           const success = await this.initializeDatabase();
           if (!success) {
-            return new Response(JSON.stringify({ 
-              error: "Failed to initialize database." 
-            }), { 
+            return new Response(JSON.stringify({
+              error: "Failed to initialize database."
+            }), {
               status: 500,
-              headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
         }
-        
+
         // Handle query within transaction context
         if (transaction_id) {
           const txContext = this.transactionContexts.get(transaction_id);
@@ -717,11 +709,11 @@ export class ORMDO {
                       ...storedCtx,
                       readTables: new Set<string>(storedCtx.readTables || []),
                       writeTables: new Set<string>(storedCtx.writeTables || []),
-                      results: storedCtx.results || [] 
+                      results: storedCtx.results || []
                     };
                     this.transactionContexts.set(transaction_id, restoredCtx);
                     console.log(`Successfully recovered transaction ${transaction_id} from storage for query`);
-                    
+
                     // Process the request again with the recovered context
                     return this.fetch(request);
                   }
@@ -730,26 +722,26 @@ export class ORMDO {
                 console.error(`Failed to recover transaction ${transaction_id} from storage for query:`, error);
               }
             }
-            
-            return new Response(JSON.stringify({ 
+
+            return new Response(JSON.stringify({
               error: `Transaction not found or inactive: ${transaction_id}`,
-              status: txContext?.status || 'unknown' 
-            }), { 
-              status: 404, 
-              headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+              status: txContext?.status || 'unknown'
+            }), {
+              status: 404,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
-          
+
           // Update activity timestamp
           txContext.lastActivity = Date.now();
-          
+
           try {
             // Parse SQL to identify affected tables
             const affectedTables = this.extractAffectedTables(sql);
-            
+
             // Check if read-only or write operation
             const isWrite = /INSERT|UPDATE|DELETE|CREATE|DROP|ALTER/i.test(sql);
-            
+
             // For write operations, track tables being written to
             if (isWrite) {
               affectedTables.forEach(table => txContext.writeTables.add(table));
@@ -757,53 +749,53 @@ export class ORMDO {
               // For read operations, track tables being read from
               affectedTables.forEach(table => txContext.readTables.add(table));
             }
-            
+
             // Look for conflicts with other active transactions
             const conflictingTxId = this.hasConflictingTransaction(transaction_id, affectedTables, isWrite);
             if (conflictingTxId) {
-              return new Response(JSON.stringify({ 
-                error: `Transaction conflict detected with transaction ${conflictingTxId}` 
-              }), { 
+              return new Response(JSON.stringify({
+                error: `Transaction conflict detected with transaction ${conflictingTxId}`
+              }), {
                 status: 409, // Conflict
-                headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" }
               });
             }
-            
+
             // Store operation for later execution at commit time
             txContext.operations.push({ sql, params });
-            
+
             // SIMPLIFIED APPROACH: Execute the query directly without preview mode
             // Just execute the query normally and get the result
             let result;
-            const cursor = await this.sql.exec(sql, ...params);
-            result = await cursor.toArray();
-            
+            const cursor = this.sql.exec(sql, ...params);
+            result = cursor.toArray();
+
             // Store result for later reference
             if (!txContext.results) {
               txContext.results = [];
             }
             txContext.results.push(result);
-            
+
             // Update transaction context in storage
             txContext.lastActivity = Date.now();
             await this.saveTransactionContext(transaction_id, txContext);
-            
+
             console.log(`TX ${transaction_id}: Executed operation #${txContext.operations.length}: ${sql.substring(0, 80)}...`);
-            
+
             return new Response(JSON.stringify(result), {
               headers: { ...this.corsHeaders, "Content-Type": "application/json" },
             });
           } catch (error: any) {
             console.error("Transaction query error:", error);
             return new Response(JSON.stringify({ error: error.message }), {
-              status: 400, 
+              status: 400,
               headers: { ...this.corsHeaders, "Content-Type": "application/json" },
             });
           }
         } else {
           // Regular non-transactional query handling
-          const cursor = await this.sql.exec(sql, ...params);
-          const result = await cursor.toArray(); 
+          const cursor = this.sql.exec(sql, ...params);
+          const result = cursor.toArray();
 
           return new Response(JSON.stringify(result), {
             headers: { ...this.corsHeaders, "Content-Type": "application/json" },
@@ -824,11 +816,11 @@ export class ORMDO {
           console.log("Raw query requested but database not initialized, initializing...");
           const success = await this.initializeDatabase();
           if (!success) {
-            return new Response(JSON.stringify({ 
-              error: "Failed to initialize database." 
-            }), { 
+            return new Response(JSON.stringify({
+              error: "Failed to initialize database."
+            }), {
               status: 500,
-              headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
         }
@@ -838,12 +830,12 @@ export class ORMDO {
         if (data.transaction) {
           // Handle transaction batch using storage.transaction()
           const results: RawQueryResult[] = [];
-          await this.state.storage.transaction(async () => { 
-              for (const query of data.transaction!) { 
-                  const cursor = await this.sql.exec(query.sql, ...(query.params || []));
+          await this.state.storage.transaction(async () => {
+              for (const query of data.transaction!) {
+                  const cursor = this.sql.exec(query.sql, ...(query.params || []));
                   results.push({
                       columns: cursor.columnNames,
-                      rows: Array.from(await cursor.raw()), // Convert Iterator to Array
+                      rows: Array.from(cursor.raw()), // Convert Iterator to Array
                       meta: {
                           rows_read: cursor.rowsRead,
                           rows_written: cursor.rowsWritten,
@@ -854,13 +846,13 @@ export class ORMDO {
           // Return the result of the last statement in the batch
           finalResult = results.length > 0 ? results[results.length - 1] : { columns: [], rows: [], meta: { rows_read: 0, rows_written: 0 } };
           finalResult.rows = []; // Kysely expects empty rows from buffered transaction executeQuery
-        
+
         } else if (data.sql) {
           // Handle single raw query
-          const cursor = await this.sql.exec(data.sql, ...(data.params || []));
+          const cursor = this.sql.exec(data.sql, ...(data.params || []));
           finalResult = {
             columns: cursor.columnNames,
-            rows: Array.from(await cursor.raw()), // Convert Iterator to Array
+            rows: Array.from(cursor.raw()), // Convert Iterator to Array
             meta: {
               rows_read: cursor.rowsRead,
               rows_written: cursor.rowsWritten,
@@ -870,33 +862,33 @@ export class ORMDO {
             throw new Error("Invalid request to /query/raw: missing 'sql' or 'transaction'");
         }
 
-       return new Response(JSON.stringify(finalResult), { 
+       return new Response(JSON.stringify(finalResult), {
          headers: { ...this.corsHeaders, "Content-Type": "application/json" },
        });
       }
-      
+
       // Transaction management endpoint
       if (path === "/transaction" && request.method === "POST") {
         const { operation, transaction_id } = await request.json() as TransactionRequest;
-        
+
         // Instead of failing, ensure database is initialized on demand
         if (!this.initialized) {
           console.log("Transaction requested but database not initialized, initializing on demand...");
           const success = await this.initializeDatabase();
           if (!success) {
-            return new Response(JSON.stringify({ 
-              error: "Failed to initialize database on demand." 
-            }), { 
-              status: 500, // Internal Server Error 
-              headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+            return new Response(JSON.stringify({
+              error: "Failed to initialize database on demand."
+            }), {
+              status: 500, // Internal Server Error
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
         }
-        
+
         if (operation === "begin") {
           const txId = crypto.randomUUID();
           const bookmark = await this.state.storage.getCurrentBookmark();
-          
+
           const txContext = {
             id: txId,
             bookmark,
@@ -908,29 +900,29 @@ export class ORMDO {
             status: 'active' as TransactionStatus,
             results: [] // Initialize results array
           };
-          
+
           // Store in memory
           this.transactionContexts.set(txId, txContext);
-          
+
           // Persist to storage
           await this.saveTransactionContext(txId, txContext);
-          
-          return new Response(JSON.stringify({ 
-            transaction_id: txId, 
-            status: 'active' 
-          } as TransactionResponse), { 
-            headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+
+          return new Response(JSON.stringify({
+            transaction_id: txId,
+            status: 'active'
+          } as TransactionResponse), {
+            headers: { ...this.corsHeaders, "Content-Type": "application/json" }
           });
         }
-        
+
         if (operation === "commit" || operation === "rollback") {
           if (!transaction_id) {
-            return new Response(JSON.stringify({ error: "Missing transaction_id" }), { 
-              status: 400, 
-              headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+            return new Response(JSON.stringify({ error: "Missing transaction_id" }), {
+              status: 400,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
-          
+
           const txContext = this.transactionContexts.get(transaction_id);
           if (!txContext || txContext.status !== 'active') {
             // Try to recover from storage if not in memory
@@ -950,7 +942,7 @@ export class ORMDO {
                     };
                     this.transactionContexts.set(transaction_id, restoredCtx);
                     console.log(`Successfully recovered transaction ${transaction_id} from storage`);
-                    
+
                     // Process the request again with the recovered context
                     return this.fetch(request);
                   }
@@ -959,83 +951,83 @@ export class ORMDO {
                 console.error(`Failed to recover transaction ${transaction_id} from storage:`, error);
               }
             }
-            
+
             // If we get here, the transaction couldn't be recovered
-            return new Response(JSON.stringify({ 
+            return new Response(JSON.stringify({
               error: "Transaction not found or inactive",
               transaction_id,
               status: txContext?.status || 'unknown'
-            } as TransactionResponse), { 
-              status: 404, 
-              headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+            } as TransactionResponse), {
+              status: 404,
+              headers: { ...this.corsHeaders, "Content-Type": "application/json" }
             });
           }
-          
+
           if (operation === "commit") {
             try {
               console.log(`Committing transaction ${transaction_id} with ${txContext.operations.length} operations`);
-              
+
               // Mark transaction as committed - no need to re-execute anything
               txContext.status = 'committed';
               txContext.lastActivity = Date.now();
-              
+
               // Update the transaction context in persistent storage
               await this.saveTransactionContext(transaction_id, txContext);
-              
+
               // Return successful response with the results we already have
-              const response = new Response(JSON.stringify({ 
-                transaction_id, 
+              const response = new Response(JSON.stringify({
+                transaction_id,
                 status: 'committed',
                 results: txContext.results // We already have the real results
-              }), { 
-                headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+              }), {
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" }
               });
-              
+
               // Schedule cleanup for later without blocking the response
               this.cleanupTransactionAfterDelay(transaction_id, 60000).catch(e => {
                 console.error(`Error committing transaction ${transaction_id}:`, e);
               });
-              
+
               return response;
             } catch (error: any) {
               console.error("Transaction commit error:", error);
               return new Response(JSON.stringify({ error: error.message }), {
-                status: 500, 
+                status: 500,
                 headers: { ...this.corsHeaders, "Content-Type": "application/json" },
               });
             }
           }
-          
+
           if (operation === "rollback") {
             try {
               console.log(`Rolling back transaction ${transaction_id} with ${txContext.operations.length} operations`);
-              
+
               // Mark transaction as rolled back - no need to re-execute anything
               txContext.status = 'rolledback';
               txContext.lastActivity = Date.now();
-              
+
               // Update the transaction context in persistent storage
               await this.saveTransactionContext(transaction_id, txContext);
-              
+
               // Return successful response with the results we already have
-              const response = new Response(JSON.stringify({ 
-                transaction_id, 
+              const response = new Response(JSON.stringify({
+                transaction_id,
                 status: 'rolledback',
                 results: txContext.results // We already have the real results
-              }), { 
-                headers: { ...this.corsHeaders, "Content-Type": "application/json" } 
+              }), {
+                headers: { ...this.corsHeaders, "Content-Type": "application/json" }
               });
-              
+
               // Schedule cleanup for later without blocking the response
               this.cleanupTransactionAfterDelay(transaction_id, 60000).catch(e => {
                 console.error(`Error rolling back transaction ${transaction_id}:`, e);
               });
-              
+
               return response;
             } catch (error: any) {
               console.error("Transaction rollback error:", error);
               return new Response(JSON.stringify({ error: error.message }), {
-                status: 500, 
+                status: 500,
                 headers: { ...this.corsHeaders, "Content-Type": "application/json" },
               });
             }
@@ -1045,7 +1037,7 @@ export class ORMDO {
     } catch (error: any) {
       console.error("Error processing request:", error);
       return new Response(JSON.stringify({ error: error.message }), {
-        status: 500, 
+        status: 500,
         headers: { ...this.corsHeaders, "Content-Type": "application/json" },
       });
     }
