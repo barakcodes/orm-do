@@ -21,7 +21,9 @@ X Post: https://x.com/janwilmake/status/1912146275597721959
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/janwilmake/orm-do)
 
-# Usage
+# Base Usage (queryState.ts)
+
+This section describes the low-level client provided by `queryState.ts`.
 
 In your `wrangler.toml`
 
@@ -66,6 +68,7 @@ type Env = {
 
 export default {
   fetch: async (request: Request, env: Env, ctx: any) => {
+    // Create the low-level client
     const client = createDBClient(env.MY_EXAMPLE_DO, dbConfig);
 
     // First try to handle the request with the middleware
@@ -83,7 +86,7 @@ export default {
     const url = new URL(request.url);
     const method = request.method;
 
-    ///... YOUR ENDPOINTS HERE USING DB CLIENT
+    ///... YOUR ENDPOINTS HERE USING DB CLIENT or the Type-Safe Query Builder
   },
 };
 ```
@@ -98,188 +101,165 @@ I'm still experimenting. Hit me up if you've got ideas!
 
 Made by [janwilmake](https://x.com/janwilmake).
 
-# ORM-DO with Kysely Integration
+# Using the Type-Safe Query Builder (`db.ts`)
 
-This library provides a Cloudflare Durable Objects-based SQLite database with a Kysely ORM integration.
+This library includes a type-safe query builder (`db.ts`) inspired by Kysely, designed to work on top of the `DBClient` from `queryState.ts`. It provides better type inference and safety for your database interactions.
 
-## Features
+## Setup
 
-- Easy-to-use Durable Object-based SQLite database
-- Kysely ORM integration for type-safe queries
-- Supports transactions
-- Simple middleware for HTTP API access
+1.  **Define Your Database Interface:** Create a TypeScript interface that describes your database schema.
 
-## Installation
+    ```typescript
+    import { Generated, ColumnType } from './db';
 
-```bash
-npm install kysely
-```
-
-## Basic Usage
-
-### Create a DB Client
-
-```typescript
-import { createDBClient } from './queryState';
-
-// Define schema
-const schema = `
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL
-  );
-`;
-
-// Create DB client
-const dbClient = createDBClient(env.DB_NAMESPACE, { schema });
-```
-
-### Use Raw Queries
-
-```typescript
-// Standard query (returns objects)
-const users = await dbClient.standardQuery('SELECT * FROM users');
-
-// Raw query (returns columns and rows)
-const results = await dbClient.rawQuery('SELECT * FROM users');
-
-// Transaction
-await dbClient.transactionQuery(`
-  INSERT INTO users (id, name, email) VALUES ('1', 'John', 'john@example.com');
-  INSERT INTO users (id, name, email) VALUES ('2', 'Jane', 'jane@example.com');
-`);
-```
-
-### Use with Kysely ORM
-
-You can use Kysely with ORM-DO in two ways:
-
-#### Option 1: Using an existing DBClient
-
-```typescript
-import { createDBClient } from './queryState';
-import { createKysely } from './kysely';
-
-// Define your database schema for TypeScript
-interface Database {
-  users: {
-    id: string;
-    name: string;
-    email: string;
-    created_at: string;
-  }
-}
-
-// First create a DB client
-const dbClient = createDBClient(env.DB_NAMESPACE, { schema });
-
-// Then create a Kysely instance from the client
-const db = createKysely<Database>(dbClient);
-```
-
-#### Option 2: Direct Kysely instantiation
-
-```typescript
-import { ORMDODialect } from './kysely';
-import { Kysely } from 'kysely';
-
-// Define your database schema for TypeScript
-interface Database {
-  users: {
-    id: string;
-    name: string;
-    email: string;
-    created_at: string;
-  }
-}
-
-// Create a Kysely instance directly
-const db = new Kysely<Database>({
-  dialect: new ORMDODialect({
-    doNamespace: env.DB_NAMESPACE,
-    config: { 
-      schema: `CREATE TABLE IF NOT EXISTS users (...);`,
-      version: 'v1', // optional
+    interface UserTable {
+      id: Generated<string>; // Auto-generated primary key
+      name: string;
+      email: string | null; // Nullable email
+      created_at: ColumnType<Date, string | undefined, never>; // Selects as Date, inserts as optional string, never updated
     }
-  }),
-});
-```
 
-#### Using the Kysely instance
+    interface PostTable {
+      id: Generated<number>;
+      title: string;
+      content: string;
+      author_id: string; // Foreign key to UserTable.id
+      published_at: Date | null;
+    }
+
+    // Your main database interface
+    export interface Database {
+      users: UserTable;
+      posts: PostTable;
+      // Add other tables here
+    }
+    ```
+
+2.  **Create the Query Builder Instance:** Use the `createDB` factory function, passing your low-level `DBClient`.
+
+    ```typescript
+    import { createDB } from './db';
+    import { createDBClient } from './queryState';
+    import type { Database } from './your-database-interface-file'; // Import your DB interface
+
+    // Assuming 'client' is your DBClient instance from createDBClient()
+    const client = createDBClient(env.MY_EXAMPLE_DO, dbConfig);
+
+    // Create the type-safe DB instance
+    const db = createDB<Database>(client);
+    ```
+
+## Query Examples
+
+Now you can use the `db` instance to build queries:
+
+**Select:**
 
 ```typescript
-// Insert a user
-await db
-  .insertInto('users')
-  .values({
-    id: '1',
-    name: 'John Doe',
-    email: 'john@example.com',
-    created_at: new Date().toISOString(),
-  })
+// Select specific columns
+const users = await db.selectFrom('users')
+  .select(['id', 'name'])
+  .where('name', 'like', 'J%')
+  .orderBy('created_at', 'desc')
+  .limit(10)
+  .execute();
+// users will be: { id: string; name: string; }[]
+
+// Select all columns
+const posts = await db.selectFrom('posts')
+  .selectAll()
+  .where('author_id', '=', userId)
+  .executeTakeFirst(); // Get single result or undefined
+// posts will be: Selectable<PostTable> | undefined
+
+// Select with count
+const { count } = await db.selectFrom('users')
+  .count()
+  .executeTakeFirstOrThrow(); // Get count or throw error
+```
+
+**Insert:**
+
+```typescript
+const newUser = {
+  id: crypto.randomUUID(), // Or let the DB generate if `Generated` is used correctly with DB defaults
+  name: 'Alice',
+  // email is optional (nullable)
+  // created_at is optional (InsertType allows undefined)
+};
+
+await db.insertInto('users')
+  .values(newUser)
   .execute();
 
-// Query data
-const user = await db
-  .selectFrom('users')
-  .select(['id', 'name', 'email'])
-  .where('id', '=', '1')
-  .executeTakeFirst();
+// Batch insert
+await db.insertInto('posts')
+  .values([
+    { title: 'Post 1', content: '...', author_id: userId },
+    { title: 'Post 2', content: '...', author_id: userId },
+  ])
+  .execute();
 ```
 
-## Transactions with Kysely
+**Update:**
 
 ```typescript
-await db.transaction().execute(async (trx) => {
-  await trx
-    .insertInto('users')
+const userIdToUpdate = 'some-user-id';
+
+await db.update('users')
+  .set({ name: 'Alice Updated', email: 'alice.updated@example.com' })
+  .where('id', '=', userIdToUpdate)
+  .execute();
+```
+
+**Delete:**
+
+```typescript
+const postIdToDelete = 123;
+
+await db.deleteFrom('posts')
+  .where('id', '=', postIdToDelete)
+  .execute();
+```
+
+**Transactions:**
+
+Use the `transaction` method. The callback receives a transaction-specific `db` instance (`trx`).
+
+```typescript
+await db.transaction(async (trx) => {
+  // Operations within this callback run in a transaction
+
+  const newUser = await trx.insertInto('users')
+    .values({ name: 'Bob', id: crypto.randomUUID() })
+    // .returning(['id']) // Note: returning() is not currently implemented
+    .executeTakeFirst(); // Assuming execute on insert returns the inserted row or relevant info
+
+  // Use the result from the first insert (if needed and returned)
+  // const bobUserId = newUser.id; 
+
+  await trx.insertInto('posts')
     .values({
-      id: '1',
-      name: 'John Doe',
-      email: 'john@example.com',
-      created_at: new Date().toISOString(),
+      title: 'Bobs First Post',
+      content: 'Hello world!',
+      author_id: 'some-id' // Replace with actual ID if returned
     })
     .execute();
-    
-  await trx
-    .insertInto('users')
-    .values({
-      id: '2', 
-      name: 'Jane Doe',
-      email: 'jane@example.com',
-      created_at: new Date().toISOString(),
-    })
-    .execute();
+
+  // If any operation fails, the transaction is automatically rolled back.
+  // If all succeed, it's committed.
 });
 ```
 
-## HTTP API Middleware
+**Raw SQL:**
 
 ```typescript
-// In your worker
-export default {
-  async fetch(request, env) {
-    // Try the DB middleware
-    const response = await dbClient.middleware(request, {
-      prefix: '/api/db',
-      secret: 'your-auth-secret', // Optional authentication
-    });
-    
-    if (response) return response;
-    
-    // Handle other routes...
-    return new Response('Not Found', { status: 404 });
-  }
-}
+// Use raw SQL when needed, but lose type safety
+const results = await db.raw<{
+  total_users: number
+}>('SELECT COUNT(*) as total_users FROM users WHERE name LIKE ?', ['A%']);
+
+const total = results[0].total_users;
 ```
 
-## HTTP API Endpoints
-
-- `POST /api/db/init` - Initialize the database schema
-- `POST /api/db/query` - Execute a standard SQL query
-- `POST /api/db/query/raw` - Execute a raw SQL query
-
-## License
-
-MIT
+This query builder provides a more structured and type-safe way to interact with your Durable Object database compared to raw SQL strings alone.
