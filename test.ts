@@ -1,19 +1,28 @@
 import { ORMDO, DBConfig, createDBClient } from "./queryState";
 import { adminHtml } from "./adminHtml";
-import { ORMDODialect } from './kysely';
-import { Kysely } from 'kysely';
+// Remove Kysely imports
+// import { ORMDODialect } from './kysely';
+// import { Kysely } from 'kysely';
+
+// Import the new DB client and types
+import { createDB, DB, Generated, ColumnType, Database as BaseDatabase } from './db'; // Import BaseDatabase
 
 export { ORMDO };
 
-// Define database schema for TypeScript
-interface Database {
-  users: {
-    id: string;
-    name: string;
-    email: string | null;
-    created_at: string;
-  };
+// Define database schema using new types
+// Extend BaseDatabase to satisfy constraint
+interface Database extends BaseDatabase {
+  users: UserTable;
 }
+
+interface UserTable {
+  // Remove Generated wrapper since ID is client-provided
+  id: string; 
+  name: string;
+  email: ColumnType<string | null, string, string | null>; // Allow null select/update, require string on insert
+  created_at: ColumnType<Date, string | undefined, never>; // Select as Date, insert optional string, never update
+}
+
 
 const dbConfig: DBConfig = {
   /** Put your CREATE TABLE queries here */
@@ -46,16 +55,11 @@ const corsHeaders = {
 
 export default {
   fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
-    // First create a DB client for middleware access
+    // Create DB client (used for middleware and the main DB instance)
     const client = createDBClient(env.MY_EXAMPLE_DO, dbConfig);
     
-    // Create Kysely instance
-    const db = new Kysely<Database>({
-      dialect: new ORMDODialect({
-        doNamespace: env.MY_EXAMPLE_DO,
-        config: dbConfig,
-      }),
-    });
+    // Create the new DB instance with types
+    const db = createDB<Database>(client);
     
     // Handle CORS preflight requests
     if (request.method === "OPTIONS") {
@@ -90,6 +94,7 @@ export default {
     // Handle API routes based on method
     if (url.pathname.startsWith("/api/")) {
       try {
+        // Pass the new db instance to handlers
         if (method === "GET") {
           return await handleGet(request, db);
         } else if (method === "POST") {
@@ -100,6 +105,7 @@ export default {
           return await handleDelete(request, db);
         }
       } catch (error) {
+        console.error("API Error:", error); // Log the error
         return new Response(
           JSON.stringify({ error: (error as Error).message || "An error occurred" }),
           {
@@ -115,10 +121,10 @@ export default {
   },
 };
 
-// Handle GET requests
-export const handleGet = async (
+// Handle GET requests - Update db parameter type
+const handleGet = async (
   request: Request,
-  db: Kysely<Database>,
+  db: DB<Database>, // Use the new DB type
 ) => {
   const url = new URL(request.url);
 
@@ -128,13 +134,14 @@ export const handleGet = async (
       const users = await db
         .selectFrom("users")
         .selectAll()
-        .orderBy("created_at", "desc")
+        .orderBy("created_at", "desc") // Assumes created_at can be ordered directly
         .execute();
 
       return new Response(JSON.stringify(users), {
         headers: corsHeaders,
       });
     } catch (error) {
+       console.error("GET /api/users Error:", error);
       return new Response(
         JSON.stringify({ error: "Failed to fetch users" }),
         {
@@ -153,7 +160,7 @@ export const handleGet = async (
       const user = await db
         .selectFrom("users")
         .selectAll()
-        .where("id", "=", userId)
+        .where("id", "=", userId) // Use the base type for comparison
         .executeTakeFirst();
 
       if (!user) {
@@ -165,11 +172,17 @@ export const handleGet = async (
           }
         );
       }
+       // Manually parse date if needed, assuming DB returns string/number
+      if (user.created_at && typeof user.created_at !== 'object') {
+         user.created_at = new Date(user.created_at);
+      }
+
 
       return new Response(JSON.stringify(user), {
         headers: corsHeaders,
       });
     } catch (error) {
+      console.error(`GET /api/users/${userId} Error:`, error);
       return new Response(
         JSON.stringify({ error: "Failed to fetch user" }),
         {
@@ -184,81 +197,92 @@ export const handleGet = async (
   return new Response("Not found", { status: 404 });
 };
 
-// Handle POST requests
-export const handlePost = async (
+// Handle POST requests - Update db parameter type
+const handlePost = async (
   request: Request,
-  db: Kysely<Database>,
+  db: DB<Database>,
 ) => {
   const url = new URL(request.url);
 
   // Create a new user
   if (url.pathname === "/api/users") {
+
     try {
+      // id is now required in the body because it's not Generated
       const body = (await request.json()) as {
-        id?: string;
+        id: string; // Make id required in body
         name: string;
-        email: string;
+        email: string; 
       };
 
-      if (!body.name || !body.email) {
+      // Validate required fields including id
+      if ( !body.name || !body.email) {
         return new Response(
-          JSON.stringify({ error: "Name and email are required" }),
+          JSON.stringify({ error: "ID, Name and email are required" }),
           {
             status: 400,
             headers: corsHeaders,
           }
         );
       }
+  console.log("___insertInto", body)
+      const userId = body.id;
+      await db
+      .insertInto("users")
+      .values({
+        id: userId, // Pass the required id
+        name: body.name,
+        email: body.email,
+      })
+      .executeTakeFirstOrThrow();
+      // Use db.transaction for atomicity
+      const user = await db.transaction(async (trx) => {
+        // Insert user
+        await trx
+          .insertInto("users")
+          .values({
+            id: userId, // Pass the required id
+            name: body.name,
+            email: body.email,
+          })
+          .execute();
+        
+        // Select the inserted user (since returning is not built-in)
+        const insertedUser = await trx.selectFrom("users")
+          .selectAll()
+          .where("id", "=", userId)
+          .executeTakeFirstOrThrow(); // Throw if not found (shouldn't happen)
+          
+         // Update example within transaction
+         await trx.update("users")
+           .set({
+             name: `${insertedUser.name}-Updated`
+           })
+           .where("id", "=", userId)
+           .execute();
 
-      // Generate random ID if not provided
-      const userId = body.id || crypto.randomUUID();
-      const createdAt = new Date().toISOString();
+        // Select again to get the final state after update
+         const finalUser = await trx.selectFrom("users")
+          .selectAll()
+          .where("id", "=", userId)
+          .executeTakeFirstOrThrow();
 
-     const user = await db.transaction().execute(async (trx) => {
-      // Insert the user
-      const user = await trx
-        .insertInto("users")
-        .values({
-          id: userId,
-          name: body.name,
-          email: body.email,
-          created_at: createdAt,
-        })
-        .returning(["id", "name", "email", "created_at"])
-        .executeTakeFirst();
-        console.log("__user", user)
-        const inserted = await trx.selectFrom("users").selectAll().where("id", "=", userId).executeTakeFirst();
-        console.log("__inserted", inserted)
+        // Manually parse date if needed
+        if (finalUser.created_at && typeof finalUser.created_at !== 'object') {
+           finalUser.created_at = new Date(finalUser.created_at);
+        }
 
-        await trx.updateTable("users")
-        .set({
-          name: `${user?.name}-123`
-        })
-        .where("id", "=", user?.id|| userId)
-        .execute();
-
-        return user
+        return finalUser; // Return the final state
       });
-
-    // const user = await db
-    // .insertInto("users")
-    // .values({
-    //   id: userId,
-    //   name: body.name,
-    //   email: body.email,
-    //   created_at: createdAt,
-    // })
-    // .returning(["id", "name", "email", "created_at"])
-    // .executeTakeFirst();
-    console.log("__user", user)
+      
       return new Response(JSON.stringify(user), {
-        status: 201,
+        status: 201, // Created
         headers: corsHeaders,
       });
     
     } catch (error) {
-      // Check for unique constraint violation (email already exists)
-      const errorMsg = (error as Error).message || "";
+       console.error("POST /api/users Error:", error);
+       const errorMsg = (error as Error).message || "";
       if (errorMsg.includes("UNIQUE constraint failed: users.email")) {
         return new Response(
           JSON.stringify({ error: "Email already exists" }),
@@ -283,23 +307,24 @@ export const handlePost = async (
   return new Response("Not found", { status: 404 });
 };
 
-// Handle PUT requests
-export const handlePut = async (
+// Handle PUT requests - Update db parameter type
+const handlePut = async (
   request: Request,
-  db: Kysely<Database>,
+  db: DB<Database>, // Use the new DB type
 ) => {
   const url = new URL(request.url);
 
   // Update a user
   if (url.pathname.startsWith("/api/users/") && url.pathname.length > 11) {
+    const userId = url.pathname.substring(11);
     try {
-      const userId = url.pathname.substring(11);
-      const body = (await request.json()) as { name?: string; email?: string };
+      // Body type matches Updateable<UserTable>
+      const body = (await request.json()) as { name?: string; email?: string | null };
 
-      if (!body.name && !body.email) {
+      if (!body.name && body.email === undefined) { // Check if email is explicitly provided (even null)
         return new Response(
           JSON.stringify({
-            error: "At least one field (name or email) is required",
+            error: "At least one field (name or email) must be provided for update",
           }),
           {
             status: 400,
@@ -308,10 +333,10 @@ export const handlePut = async (
         );
       }
 
-      // Check if user exists
+      // Check if user exists before update
       const existingUser = await db
         .selectFrom("users")
-        .selectAll()
+        .select('id') // Select minimal data
         .where("id", "=", userId)
         .executeTakeFirst();
 
@@ -325,29 +350,39 @@ export const handlePut = async (
         );
       }
 
-      // Build update query based on provided fields
-      const updateQuery = db
-        .updateTable("users")
-        .where("id", "=", userId);
-
-      // Add fields to update
-      if (body.name) {
-        updateQuery.set("name", body.name);
+      // Build update object matching Updateable<UserTable>
+      const updateData: { name?: string; email?: string | null } = {};
+      if (body.name !== undefined) {
+        updateData.name = body.name;
       }
-      if (body.email) {
-        updateQuery.set("email", body.email);
+      if (body.email !== undefined) { // Allow setting email to null
+        updateData.email = body.email;
       }
+      
+      // Perform update
+      await db
+        .update("users")
+        .set(updateData) // Pass the typed update object
+        .where("id", "=", userId)
+        .execute();
 
-      // Execute update and return the updated user
-      const updatedUser = await updateQuery
-        .returning(["id", "name", "email", "created_at"])
-        .executeTakeFirstOrThrow();
+      // Fetch the updated user data
+      const updatedUser = await db
+        .selectFrom("users")
+        .selectAll()
+        .where("id", "=", userId)
+        .executeTakeFirstOrThrow(); // Throw if somehow deleted
+
+       // Manually parse date if needed
+       if (updatedUser.created_at && typeof updatedUser.created_at !== 'object') {
+          updatedUser.created_at = new Date(updatedUser.created_at);
+       }
 
       return new Response(JSON.stringify(updatedUser), {
         headers: corsHeaders,
       });
     } catch (error) {
-      // Check for unique constraint violation (email already exists)
+      console.error(`PUT /api/users/${userId} Error:`, error);
       const errorMsg = (error as Error).message || "";
       if (errorMsg.includes("UNIQUE constraint failed: users.email")) {
         return new Response(
@@ -373,10 +408,10 @@ export const handlePut = async (
   return new Response("Not found", { status: 404 });
 };
 
-// Handle DELETE requests
-export const handleDelete = async (
+// Handle DELETE requests - Update db parameter type
+const handleDelete = async (
   request: Request,
-  db: Kysely<Database>,
+  db: DB<Database>, // Use the new DB type
 ) => {
   const url = new URL(request.url);
 
@@ -385,14 +420,14 @@ export const handleDelete = async (
     const userId = url.pathname.substring(11);
 
     try {
-      // Check if user exists
-      const existingUser = await db
+      // Fetch user data before deleting (to return it)
+      const userToDelete = await db
         .selectFrom("users")
         .selectAll()
         .where("id", "=", userId)
         .executeTakeFirst();
 
-      if (!existingUser) {
+      if (!userToDelete) {
         return new Response(
           JSON.stringify({ error: "User not found" }),
           {
@@ -402,23 +437,28 @@ export const handleDelete = async (
         );
       }
 
-      // Delete the user and return the deleted user data
-      const deletedUser = await db
+      // Perform delete operation
+      await db
         .deleteFrom("users")
         .where("id", "=", userId)
-        .returning(["id", "name", "email", "created_at"])
-        .executeTakeFirstOrThrow();
+        .execute();
+
+      // Manually parse date if needed
+      if (userToDelete.created_at && typeof userToDelete.created_at !== 'object') {
+         userToDelete.created_at = new Date(userToDelete.created_at);
+      }
 
       return new Response(
         JSON.stringify({
           message: "User deleted successfully",
-          user: deletedUser,
+          user: userToDelete, // Return the data fetched before delete
         }),
         {
           headers: corsHeaders,
         }
       );
     } catch (error) {
+      console.error(`DELETE /api/users/${userId} Error:`, error);
       return new Response(
         JSON.stringify({ error: "Failed to delete user" }),
         {
@@ -433,26 +473,26 @@ export const handleDelete = async (
   return new Response("Not found", { status: 404 });
 };
 
-// Example of other operations using Kysely
-export async function kyselyExamples(doNamespace: DurableObjectNamespace) {
-  // Initialize Kysely with the dialect
-  const db = new Kysely<Database>({
-    dialect: new ORMDODialect({
-      doNamespace,
-      config: dbConfig,
-    }),
-  });
+// Example of other operations using the new client
+// Rename function to reflect the new client
+export async function dbClientExamples(env: Env) {
+
+   // Create DB client and typed DB instance
+    const client = createDBClient(env.MY_EXAMPLE_DO, dbConfig);
+    const db = createDB<Database>(client);
   
-  // 1. Transaction example - Create multiple users in a transaction
-  await db.transaction().execute(async (trx) => {
+  // 1. Transaction example - Create multiple users
+  await db.transaction(async (trx) => {
+     const user1Id = crypto.randomUUID();
+     const user2Id = crypto.randomUUID();
     // Insert first user
     await trx
       .insertInto('users')
       .values({
-        id: crypto.randomUUID(),
-        name: 'Alice Brown',
-        email: 'alice@example.com',
-        created_at: new Date().toISOString(),
+        id: user1Id, // Provide required ID
+        name: 'Alice Brown Transaction',
+        email: 'alice.tx@example.com',
+        // created_at uses default
       })
       .execute();
     
@@ -460,25 +500,27 @@ export async function kyselyExamples(doNamespace: DurableObjectNamespace) {
     await trx
       .insertInto('users')
       .values({
-        id: crypto.randomUUID(),
-        name: 'Bob Green',
-        email: 'bob@example.com',
-        created_at: new Date().toISOString(),
+         id: user2Id, // Provide required ID
+        name: 'Bob Green Transaction',
+        email: 'bob.tx@example.com',
+         // created_at uses default
       })
       .execute();
+      
+     console.log(`Inserted users in transaction: ${user1Id}, ${user2Id}`);
   });
   
   // 2. Count users
-  const userCount = await db
+  const userCountResult = await db
     .selectFrom('users')
-    .select(({ fn }) => [
-      fn.count('id').as('count')
-    ])
+    .count() // Use the simpler count method
     .executeTakeFirstOrThrow();
+    
+   console.log("User count:", userCountResult.count);
   
   // 3. Find users with pagination
   const page = 1;
-  const pageSize = 10;
+  const pageSize = 5; // Smaller size for example
   
   const paginatedUsers = await db
     .selectFrom('users')
@@ -487,24 +529,23 @@ export async function kyselyExamples(doNamespace: DurableObjectNamespace) {
     .limit(pageSize)
     .offset((page - 1) * pageSize)
     .execute();
+    
+   console.log("Paginated users (page 1):", paginatedUsers);
   
-  // 4. Search users by name or email
-  const searchTerm = 'john';
+  // 4. Search users by name or email (using raw for OR condition)
+  const searchTerm = 'alice';
   
-  const searchResults = await db
-    .selectFrom('users')
-    .selectAll()
-    .where((eb) => 
-      eb.or([
-        eb('name', 'like', `%${searchTerm}%`),
-        eb('email', 'like', `%${searchTerm}%`),
-      ])
-    )
-    .execute();
+  // Raw query is better for complex OR conditions across columns with LIKE
+  const searchResults = await db.raw<UserTable>(
+     `SELECT * FROM users WHERE name LIKE ? OR email LIKE ?`,
+     [`%${searchTerm}%`, `%${searchTerm}%`]
+  );
+  
+   console.log(`Search results for "${searchTerm}":`, searchResults);
   
   // Return results
   return {
-    userCount: userCount.count,
+    userCount: userCountResult.count,
     paginatedUsers,
     searchResults,
   };
