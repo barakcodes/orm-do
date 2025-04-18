@@ -36,9 +36,9 @@ export type JSONColumnType<T> = ColumnType<T, string, string>;
 // ----- Type extraction helpers -----
 
 // Extracts the select type, unwrapping Generated types.
-type SelectType<T> = 
+type SelectType<T> =
     T extends Generated<infer G> ? G :
-    T extends ColumnType<infer S, any, any> ? S : 
+    T extends ColumnType<infer S, any, any> ? S :
     T;
 
 // Extracts the insert type, making Generated types optional.
@@ -54,6 +54,35 @@ type UpdateType<T> = T extends ColumnType<any, any, infer U> ? U : T extends Gen
  * All columns are included with their `SelectType`.
  */
 export type Selectable<T> = Prettify<{ [K in keyof T]: SelectType<T[K]> }>;
+
+// NEW: Type for qualified column names (e.g., "tableName.columnName")
+type QualifiedColumn<DB extends Database, TB extends keyof DB> = {
+    [K in TB]: `${K & string}.${keyof DB[K] & string}`
+}[TB];
+
+// NEW: Type to create a combined Selectable type after a join, using qualified names
+// Renamed from JoinedSelectable to be specific
+type LeftJoinedSelectable<DB extends Database, FromTable extends keyof DB, JoinedTable extends keyof DB> = Prettify<
+    & { [K in keyof DB[FromTable] as `${FromTable & string}.${K & string}`]: Selectable<DB[FromTable]>[K] }
+    & { [K in keyof DB[JoinedTable] as `${JoinedTable & string}.${K & string}`]: Selectable<DB[JoinedTable]>[K] | null } // Right side (JoinedTable) is nullable
+>;
+
+// NEW: Type for INNER JOIN results - no added nullability
+type InnerJoinedSelectable<DB extends Database, FromTable extends keyof DB, JoinedTable extends keyof DB> = Prettify<
+    & { [K in keyof DB[FromTable] as `${FromTable & string}.${K & string}`]: Selectable<DB[FromTable]>[K] }
+    & { [K in keyof DB[JoinedTable] as `${JoinedTable & string}.${K & string}`]: Selectable<DB[JoinedTable]>[K] }
+>;
+
+// NEW: Type for RIGHT JOIN results
+type RightJoinedSelectable<DB extends Database, FromTable extends keyof DB, JoinedTable extends keyof DB> = Prettify<
+    & { [K in keyof DB[FromTable] as `${FromTable & string}.${K & string}`]: Selectable<DB[FromTable]>[K] | null } // Left side (FromTable) is nullable
+    & { [K in keyof DB[JoinedTable] as `${JoinedTable & string}.${K & string}`]: Selectable<DB[JoinedTable]>[K] }
+>;
+
+// Type to get all possible qualified column names from the current join context
+type AllQualifiedColumns<DB extends Database, Tbls extends keyof DB> = {
+    [T in Tbls]: QualifiedColumn<DB, T>
+}[Tbls];
 
 /**
  * Extracts the insertable type shape for a table.
@@ -121,6 +150,15 @@ interface JoinClause { // Internal representation of a JOIN clause
   };
 }
 
+type JoinColumn<DB extends Database, T extends keyof DB> = keyof Selectable<DB[T]> & string;
+
+// NEW: Dynamically determine the set of valid column names (simple or qualified) based on joins.
+// Moved outside the class for broader TS compatibility.
+type CurrentColumns<DB extends Database, FromTable extends keyof DB, JoinedTables extends keyof DB> = 
+    [JoinedTables] extends [never]
+        ? keyof Selectable<DB[FromTable]> & string // Simple names if no joins
+        : AllQualifiedColumns<DB, FromTable | JoinedTables>; // Qualified names if joins exist
+
 /**
  * Internal class for building SQL queries fluently.
  * Provides methods for select, insert, update, delete operations with type safety.
@@ -130,10 +168,20 @@ interface JoinClause { // Internal representation of a JOIN clause
  * @template TB The current table key (string literal type) being queried.
  * @template SelectResult The expected shape of the result for select queries.
  */
-class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Selectable<DB[TB]>> {
+class QueryBuilder<
+    DB extends Database,
+    FromTable extends keyof DB,
+    JoinedTables extends keyof DB = never, // NEW: Track joined tables
+    SelectResult = [JoinedTables] extends [never] 
+        ? Selectable<DB[FromTable]> 
+        // TODO: This needs refinement to handle different join types correctly.
+        // For now, using LeftJoinedSelectable as a placeholder for joined results.
+        // Specific join methods will return more accurate types.
+        : LeftJoinedSelectable<DB, FromTable, JoinedTables>
+> {
   private client: DBClient;
   private transactionId: string | null; // ID for ongoing transaction, if any.
-  private fromTable: string | null = null; // Table being queried.
+  private fromTable: FromTable; // Use generic type
   private selectedColumns: string[] = []; // Columns to select.
   private whereConditions: WhereCondition[] = []; // WHERE clauses.
   private limitValue: number | null = null; // LIMIT value.
@@ -143,8 +191,8 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
   private groupByColumns: string[] = []; // GROUP BY columns.
   private isCountQuery = false; // Flag for COUNT(*) queries.
   private isDistinct = false; // Flag for SELECT DISTINCT.
-  private insertValues: Insertable<DB[TB]>[] | null = null; // Data for INSERT.
-  private updateValues: Updateable<DB[TB]> | null = null; // Data for UPDATE.
+  private insertValues: Insertable<DB[FromTable]>[] | null = null; // Data for INSERT (Use FromTable)
+  private updateValues: Updateable<DB[FromTable]> | null = null; // Data for UPDATE (Use FromTable)
   private isDeleteOperation = false; // Flag for DELETE operations.
   private returningColumns: string[] | null = null; // Added for RETURNING clause
 
@@ -154,40 +202,51 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
    * @param transactionId Optional transaction ID if operating within a transaction.
    * @param table Optional initial table name (typically set by DB methods).
    */
-  constructor(client: DBClient, transactionId: string | null = null, table?: string) {
+  constructor(client: DBClient, transactionId: string | null = null, table: FromTable) { // Use generic type
     this.client = client;
     this.transactionId = transactionId;
-    if (table) {
-      this.fromTable = table;
-    }
+    this.fromTable = table; // Store the specific table key
   }
 
   // ----- Select operations -----
-  /** Specifies columns to select. */
-  // Overload 1: Selecting specific columns
-  select<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C): QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+  /** Specifies columns to select. Accepts qualified names (e.g., "users.id") after joins. */
+  // Overload 1: Selecting specific columns (qualified or simple)
+  // Result type is a Pick from the current SelectResult shape.
+  select<C extends ReadonlyArray<CurrentColumns<DB, FromTable, JoinedTables>>>(
+      columns: C
+      // Explicitly cast C[number] to keyof SelectResult to satisfy the constraint for Pick
+  ): QueryBuilder<DB, FromTable, JoinedTables, Prettify<Pick<SelectResult, C[number] & keyof SelectResult>>>;
   // Overload 2: Selecting all columns using '*'
-  select(columns: '*'): QueryBuilder<DB, TB, Selectable<DB[TB]>>;
-  // Implementation signature
-  select<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C | '*'): QueryBuilder<DB, TB, any> {
-    if (columns === '*') {
-      this.selectedColumns = ['*'];
-      // Cast to the return type defined in the overload signature for '*'
-      return this as unknown as QueryBuilder<DB, TB, Selectable<DB[TB]>>;
-    } else if (Array.isArray(columns)) {
-      this.selectedColumns = columns as string[];
-      // Cast to the return type defined in the overload signature for specific columns
-      return this as unknown as QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
-    } else {
-      // Should not happen with the overloads, but good practice
-      throw new Error("Invalid argument passed to .select(). Expected '*' or an array of column names.");
-    }
+  // Result type is the full current SelectResult shape.
+  select(columns: '*'): QueryBuilder<DB, FromTable, JoinedTables, SelectResult>;
+  // Implementation
+  select<C extends ReadonlyArray<CurrentColumns<DB, FromTable, JoinedTables>>>(
+      columns: C | '*'
+  ): QueryBuilder<DB, FromTable, JoinedTables, any> { // Return type is dynamic
+      if (columns === '*') {
+          // Select all from base table
+          this.selectedColumns = [`${String(this.fromTable)}.*`]; // Explicit String conversion
+          // Select all from joined tables
+          this.joinClauses.forEach(join => {
+              this.selectedColumns.push(`${join.table}.*`);
+          });
+          // Return type is the full SelectResult shape for the current context
+          // Use `as any` here to bypass complex type constraint issue C[number] vs keyof SelectResult
+          return this as any; 
+      } else if (Array.isArray(columns)) {
+          // Use the provided list of (potentially qualified) columns
+          this.selectedColumns = columns as string[];
+           // Result type is a Pick from the current SelectResult shape
+           // Use `as any` here to bypass complex type constraint issue C[number] vs keyof SelectResult
+          return this as any;
+      } else {
+          throw new Error("Invalid argument passed to .select(). Expected '*' or an array of column names.");
+      }
   }
 
   /** Selects all columns. Equivalent to `select('*')`. */
-  selectAll(): QueryBuilder<DB, TB, Selectable<DB[TB]>> {
-    this.selectedColumns = ['*'];
-    return this as any; // Cast needed due to SelectResult complexity
+  selectAll(): QueryBuilder<DB, FromTable, JoinedTables, SelectResult> {
+    return this.select('*');
   }
 
   /** Adds DISTINCT to the select query. */
@@ -197,80 +256,140 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
   }
 
   /** Performs a COUNT query. */
-  count(column: string = '*'): QueryBuilder<DB, TB, { count: number }> {
-    this.selectedColumns = [`COUNT(${column}) as count`];
+  count(column: CurrentColumns<DB, FromTable, JoinedTables> | '*' = '*'): QueryBuilder<DB, FromTable, JoinedTables, { count: number }> {
+    const colName = column === '*' ? '*' : column;
+    this.selectedColumns = [`COUNT(${colName}) as count`];
     this.isCountQuery = true;
-    return this as any;
+    // The result type changes to { count: number }, join state remains.
+    return this as unknown as QueryBuilder<DB, FromTable, JoinedTables, { count: number }>;
   }
 
   // ----- Where conditions -----
-  /** Adds a WHERE condition. */
-  where<C extends keyof Selectable<DB[TB]> & string>(
-    column: C, 
-    operator: WhereOperator, 
-    value: SelectType<DB[TB][C]> | SelectType<DB[TB][C]>[] 
+  /** Adds a WHERE condition. Accepts qualified names (e.g., "users.id") after joins. */
+  // Type of `value` should ideally match the type of the column `C` in `SelectResult`.
+  // Using `any` for now to avoid overly complex conditional types here.
+  where<C extends CurrentColumns<DB, FromTable, JoinedTables>>(
+    column: C,
+    operator: WhereOperator,
+    value: any 
   ): this {
-    this.whereConditions.push({ column, operator, value });
+    this.whereConditions.push({ column: column as string, operator, value });
     return this;
   }
 
   /** Shortcut for `where(column, '=', value)`. */
-  whereEquals<C extends keyof Selectable<DB[TB]> & string>(column: C, value: SelectType<DB[TB][C]>): this {
+  whereEquals<C extends CurrentColumns<DB, FromTable, JoinedTables>>(column: C, value: any): this {
     return this.where(column, '=', value);
   }
 
   /** Shortcut for `where(column, 'in', values)`. */
-  whereIn<C extends keyof Selectable<DB[TB]> & string>(column: C, values: SelectType<DB[TB][C]>[]): this {
-    this.whereConditions.push({ column, operator: 'in', value: values });
-    return this;
+  whereIn<C extends CurrentColumns<DB, FromTable, JoinedTables>>(column: C, values: any[]): this {
+    return this.where(column, 'in', values);
   }
 
   /** Shortcut for `where(column, 'like', pattern)`. */
-  whereLike<C extends keyof Selectable<DB[TB]> & string>(column: C, pattern: string): this {
+  whereLike<C extends CurrentColumns<DB, FromTable, JoinedTables>>(column: C, pattern: string): this {
     return this.where(column, 'like', pattern as any);
   }
 
   // ----- Joins -----
-  /** Adds an INNER JOIN clause. */
-  // TODO: Improve join result typing to accurately reflect combined shape.
-  join<JoinedTable extends keyof DB>(
-    table: JoinedTable & string, 
-    leftColumn: keyof Selectable<DB[TB]> & string, 
-    operator: WhereOperator, 
-    rightColumn: keyof Selectable<DB[JoinedTable]> & string
-  ): QueryBuilder<DB, TB | JoinedTable, SelectResult & Partial<Selectable<DB[JoinedTable]>>> {
-    this.joinClauses.push({
-      type: 'inner',
-      table,
-      on: { leftColumn, operator, rightColumn }
-    });
-    return this as any;
+
+  /** Adds a LEFT JOIN clause. Assumes '=' operator. Syntax: leftJoin(<table>, <column from table>, <column from existing context>) */
+  // When joining, the JoinedTables generic is updated, and the SelectResult type changes.
+  leftJoin<JoinTable extends keyof DB>(
+      table: JoinTable & string,
+      // leftColumn must be a simple column name strictly from the new JoinTable
+      leftColumn: keyof Selectable<DB[JoinTable]> & string, 
+      // rightColumn must be a column available in the current query context (FromTable or existing JoinedTables)
+      rightColumn: CurrentColumns<DB, FromTable, JoinedTables> 
+      // The return type updates JoinedTables and recalculates SelectResult
+      // Explicitly use LeftJoinedSelectable for the return type
+  ): QueryBuilder<DB, FromTable, JoinedTables | JoinTable, LeftJoinedSelectable<DB, FromTable, JoinedTables | JoinTable>> { 
+      // Assign based on the new signature order
+      const leftColName = leftColumn as string; // Guaranteed simple name from JoinTable
+      const rightColName = rightColumn as string; // Potentially qualified name from existing context
+      
+      // Ensure right column is qualified if it wasn't already provided as such
+      const qualifiedRightCol = rightColName.includes('.') 
+          ? rightColName 
+          : `${String(this.fromTable)}.${rightColName}`; // Assume it belongs to FromTable if not qualified
+          // TODO: Handle cases where rightColName belongs to a previously JoinedTable if not qualified
+
+      // Store the join details, qualifying columns internally for the SQL builder
+      this.joinClauses.push({
+          type: 'left',
+          table,
+          on: {
+              // ON newTable.leftCol = existingContext.rightCol
+              leftColumn: `${table}.${leftColName}`, // Qualify the left column (from JoinTable)
+              operator: '=', // Assume '='
+              rightColumn: qualifiedRightCol // Use the (potentially pre-qualified) right column 
+          }
+      });
+      // Cast to the new QueryBuilder type with updated generics
+      // Use LeftJoinedSelectable in the cast
+      return this as unknown as QueryBuilder<DB, FromTable, JoinedTables | JoinTable, LeftJoinedSelectable<DB, FromTable, JoinedTables | JoinTable>>;
   }
 
-  /** Adds a LEFT JOIN clause. */
-  leftJoin<JoinedTable extends keyof DB>(
-    table: JoinedTable & string, 
-    leftColumn: keyof Selectable<DB[TB]> & string, 
-    operator: WhereOperator, 
-    rightColumn: keyof Selectable<DB[JoinedTable]> & string
-  ): QueryBuilder<DB, TB | JoinedTable, SelectResult & Partial<Selectable<DB[JoinedTable]>>> {
-    this.joinClauses.push({
-      type: 'left',
-      table,
-      on: { leftColumn, operator, rightColumn }
-    });
-    return this as any;
+  /** Adds an INNER JOIN clause. Assumes '=' operator. Syntax: innerJoin(<table>, <column from table>, <column from existing context>) */
+  innerJoin<JoinTable extends keyof DB>(
+      table: JoinTable & string,
+      leftColumn: keyof Selectable<DB[JoinTable]> & string, // from JoinTable
+      rightColumn: CurrentColumns<DB, FromTable, JoinedTables> // from existing context
+  ): QueryBuilder<DB, FromTable, JoinedTables | JoinTable, InnerJoinedSelectable<DB, FromTable, JoinedTables | JoinTable>> { 
+      const leftColName = leftColumn as string; 
+      const rightColName = rightColumn as string;
+      const qualifiedRightCol = rightColName.includes('.') 
+          ? rightColName 
+          : `${String(this.fromTable)}.${rightColName}`;
+
+      this.joinClauses.push({
+          type: 'inner', // Set type to inner
+          table,
+          on: {
+              leftColumn: `${table}.${leftColName}`,
+              operator: '=',
+              rightColumn: qualifiedRightCol
+          }
+      });
+      // Cast uses InnerJoinedSelectable
+      return this as unknown as QueryBuilder<DB, FromTable, JoinedTables | JoinTable, InnerJoinedSelectable<DB, FromTable, JoinedTables | JoinTable>>;
+  }
+
+  /** Adds a RIGHT JOIN clause. Assumes '=' operator. Syntax: rightJoin(<table>, <column from table>, <column from existing context>) */
+  rightJoin<JoinTable extends keyof DB>(
+      table: JoinTable & string,
+      leftColumn: keyof Selectable<DB[JoinTable]> & string, // from JoinTable
+      rightColumn: CurrentColumns<DB, FromTable, JoinedTables> // from existing context
+  ): QueryBuilder<DB, FromTable, JoinedTables | JoinTable, RightJoinedSelectable<DB, FromTable, JoinedTables | JoinTable>> { 
+      const leftColName = leftColumn as string; 
+      const rightColName = rightColumn as string;
+      const qualifiedRightCol = rightColName.includes('.') 
+          ? rightColName 
+          : `${String(this.fromTable)}.${rightColName}`;
+
+      this.joinClauses.push({
+          type: 'right', // Set type to right
+          table,
+          on: {
+              leftColumn: `${table}.${leftColName}`,
+              operator: '=',
+              rightColumn: qualifiedRightCol
+          }
+      });
+      // Cast uses RightJoinedSelectable
+      return this as unknown as QueryBuilder<DB, FromTable, JoinedTables | JoinTable, RightJoinedSelectable<DB, FromTable, JoinedTables | JoinTable>>;
   }
 
   // ----- Ordering and grouping -----
-  /** Adds an ORDER BY clause. */
-  orderBy(column: keyof Selectable<DB[TB]> & string, direction: 'asc' | 'desc' = 'asc'): this {
-    this.orderByColumns.push({ column, direction });
+  /** Adds an ORDER BY clause. Accepts qualified names (e.g., "users.created_at") after joins. */
+  orderBy(column: CurrentColumns<DB, FromTable, JoinedTables>, direction: 'asc' | 'desc' = 'asc'): this {
+    this.orderByColumns.push({ column: column as string, direction });
     return this;
   }
 
-  /** Adds a GROUP BY clause. */
-  groupBy(...columns: (keyof Selectable<DB[TB]> & string)[]): this {
+  /** Adds a GROUP BY clause. Accepts qualified names (e.g., "users.id") after joins. */
+  groupBy(...columns: CurrentColumns<DB, FromTable, JoinedTables>[]): this {
     this.groupByColumns = columns as string[];
     return this;
   }
@@ -353,14 +472,14 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
 
   // ----- Insert operations -----
   /** Specifies the record(s) to insert. */
-  values(records: Insertable<DB[TB]> | Insertable<DB[TB]>[]): this {
+  values(records: Insertable<DB[FromTable]> | Insertable<DB[FromTable]>[]): this {
     this.insertValues = Array.isArray(records) ? records : [records];
     return this;
   }
 
   // ----- Update operations -----
   /** Specifies the values to set in an UPDATE statement. */
-  set(values: Updateable<DB[TB]>): this {
+  set(values: Updateable<DB[FromTable]>): this {
     this.updateValues = values;
     return this;
   }
@@ -371,15 +490,15 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
    * Note: The underlying database and client must support the RETURNING clause.
    * @param columns Array of column names to return.
    */
-  returning<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C): QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+  returning<C extends ReadonlyArray<((keyof Selectable<DB[FromTable]>) & string)>>(columns: C): QueryBuilder<DB, FromTable, JoinedTables, Prettify<Pick<Selectable<DB[FromTable]>, C[number]>>>;
   /**
    * Specifies returning all columns ('*') after an INSERT, UPDATE, or DELETE operation.
    * Note: The underlying database and client must support the RETURNING clause.
    * @param columns The literal string '*'.
    */
-  returning(columns: '*'): QueryBuilder<DB, TB, Selectable<DB[TB]>>;
+  returning(columns: '*'): QueryBuilder<DB, FromTable, JoinedTables, SelectResult>;
   // Implementation signature
-  returning<C extends ReadonlyArray<((keyof Selectable<DB[TB]>) & string)>>(columns: C | '*'): QueryBuilder<DB, TB, any> {
+  returning<C extends ReadonlyArray<((keyof Selectable<DB[FromTable]>) & string)>>(columns: C | '*'): QueryBuilder<DB, FromTable, JoinedTables, any> {
       if (!this.insertValues && !this.updateValues && !this.isDeleteOperation) {
           throw new Error(".returning() can only be used after insertInto(), update(), or deleteFrom().");
       }
@@ -387,11 +506,11 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
       if (columns === '*') {
           this.returningColumns = ['*'];
           // Cast to the correct return type defined in the overload signature for '*'
-          return this as unknown as QueryBuilder<DB, TB, Selectable<DB[TB]>>;
+          return this as unknown as QueryBuilder<DB, FromTable, JoinedTables, SelectResult>;
       } else if (Array.isArray(columns)) {
           this.returningColumns = columns as string[];
            // Cast to the correct return type defined in the overload signature for array
-          return this as unknown as QueryBuilder<DB, TB, Prettify<Pick<Selectable<DB[TB]>, C[number]>>>;
+          return this as unknown as QueryBuilder<DB, FromTable, JoinedTables, Prettify<Pick<Selectable<DB[FromTable]>, C[number]>>>;
       } else {
           // Should not happen with the overload signatures, but good practice
           throw new Error("Invalid argument passed to .returning(). Expected '*' or an array of column names.");
@@ -405,55 +524,118 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
    */
   buildQuery(): { sql: string, params: any[] } {
     const params: any[] = [];
-    if (!this.fromTable) throw new Error('Table must be specified');
 
-    if (this.insertValues) return this.buildInsertQuery(params);
-    if (this.updateValues) return this.buildUpdateQuery(params);
-    if (this.isDeleteOperation) return this.buildDeleteQuery(params);
+    if (this.insertValues) {
+      return this.buildInsertQuery(params);
+    }
+    if (this.updateValues) {
+      return this.buildUpdateQuery(params);
+    }
+    if (this.isDeleteOperation) {
+      return this.buildDeleteQuery(params);
+    }
+
+    // Must be a SELECT query otherwise
     return this.buildSelectQuery(params);
   }
 
-  // Internal helper to build SELECT queries.
+  /** Builds the SELECT part of the query */
+  private buildSelectStatement(): string {
+      const distinctClause = this.isDistinct ? 'DISTINCT ' : '';
+      let columns = this.selectedColumns.length > 0 ? this.selectedColumns.join(', ') : '*';
+
+      // Handle the select('*') case with joins more explicitly
+      if (columns.includes(`${String(this.fromTable)}.*`)) { // Explicit String conversion
+           columns = `${String(this.fromTable)}.*`; // Start with base table, Explicit String conversion
+           this.joinClauses.forEach(join => {
+               columns += `, ${join.table}.*`; // Add joined tables
+           });
+      } else if (this.selectedColumns.length === 0) {
+           // Default to selecting all from base if no select was called
+           columns = `${String(this.fromTable)}.*`; // Explicit String conversion
+            this.joinClauses.forEach(join => {
+               columns += `, ${join.table}.*`; // Add joined tables
+           });
+      }
+
+
+      return `SELECT ${distinctClause}${columns} FROM ${String(this.fromTable)}`; // Explicit String conversion
+  }
+
+  /** Builds the JOIN part of the query */
+  private buildJoinClause(): string {
+    return this.joinClauses.map(join => {
+      // Use the qualified names stored in the join clause 'on' object
+      return ` ${join.type.toUpperCase()} JOIN ${join.table} ON ${join.on.leftColumn} ${join.on.operator} ${join.on.rightColumn}`;
+    }).join('');
+  }
+
+  /** Builds the WHERE part of the query */
+  private buildWhereClause(params: any[]): string {
+    if (this.whereConditions.length === 0) return '';
+
+    const whereExpressions = this.whereConditions.map(condition => {
+      if ((condition.operator === 'in' || condition.operator === 'not in') && Array.isArray(condition.value)) {
+        const placeholders = Array(condition.value.length).fill('?').join(', ');
+        params.push(...condition.value);
+        return `${condition.column} ${condition.operator} (${placeholders})`;
+      } else {
+        params.push(condition.value);
+        return `${condition.column} ${condition.operator} ?`;
+      }
+    });
+    return ` WHERE ${whereExpressions.join(' AND ')}`;
+  }
+
+  /** Builds the GROUP BY part of the query */
+  private buildGroupByClause(): string {
+    if (this.groupByColumns.length === 0) return '';
+    return ` GROUP BY ${this.groupByColumns.join(', ')}`;
+  }
+
+  /** Builds the ORDER BY part of the query */
+  private buildOrderByClause(): string {
+    if (this.orderByColumns.length === 0) return '';
+    const orderByClauses = this.orderByColumns.map(o => `${o.column} ${o.direction.toUpperCase()}`);
+    return ` ORDER BY ${orderByClauses.join(', ')}`;
+  }
+
+  /** Builds the LIMIT/OFFSET part of the query */
+  private buildLimitOffsetClause(params: any[]): string {
+    if (this.limitValue === null && this.offsetValue === null) return '';
+    let limitClause = '';
+    let offsetClause = '';
+
+    if (this.limitValue !== null) {
+      limitClause = ` LIMIT ?`;
+      params.push(this.limitValue);
+    }
+    if (this.offsetValue !== null) {
+      offsetClause = ` OFFSET ?`;
+      params.push(this.offsetValue);
+    }
+    return `${limitClause}${offsetClause}`;
+  }
+
+  /** Builds the SELECT part of the query */
   private buildSelectQuery(params: any[]): { sql: string, params: any[] } {
-    let sql = 'SELECT ';
-    if (this.isDistinct) sql += 'DISTINCT ';
-    sql += this.selectedColumns.length === 0 ? '*' : this.selectedColumns.join(', ');
-    sql += ` FROM ${this.fromTable}`;
-
-    for (const join of this.joinClauses) {
-      sql += ` ${join.type.toUpperCase()} JOIN ${join.table} ON ${join.on.leftColumn} ${join.on.operator} ${join.on.rightColumn}`;
-    }
-
-    if (this.whereConditions.length > 0) {
-      sql += ' WHERE ';
-      const whereExpressions = this.whereConditions.map(condition => {
-        if ((condition.operator === 'in' || condition.operator === 'not in') && Array.isArray(condition.value)) {
-          const placeholders = Array(condition.value.length).fill('?').join(', ');
-          params.push(...condition.value);
-          return `${condition.column} ${condition.operator} (${placeholders})`;
-        } else {
-          params.push(condition.value);
-          return `${condition.column} ${condition.operator} ?`;
-        }
-      });
-      sql += whereExpressions.join(' AND ');
-    }
-
-    if (this.groupByColumns.length > 0) sql += ` GROUP BY ${this.groupByColumns.join(', ')}`;
-    if (this.orderByColumns.length > 0) sql += ` ORDER BY ${this.orderByColumns.map(o => `${o.column} ${o.direction.toUpperCase()}`).join(', ')}`;
-    if (this.limitValue !== null) { sql += ` LIMIT ?`; params.push(this.limitValue); }
-    if (this.offsetValue !== null) { sql += ` OFFSET ?`; params.push(this.offsetValue); }
+    let sql = this.buildSelectStatement(); // SELECT ... FROM ...
+    sql += this.buildJoinClause();       // JOIN ... ON ...
+    sql += this.buildWhereClause(params);  // WHERE ...
+    sql += this.buildGroupByClause();     // GROUP BY ...
+    sql += this.buildOrderByClause();    // ORDER BY ...
+    sql += this.buildLimitOffsetClause(params); // LIMIT ... OFFSET ...
 
     return { sql, params };
   }
 
-  // Internal helper to build INSERT queries.
+  /** Builds the INSERT part of the query */
   private buildInsertQuery(params: any[]): { sql: string, params: any[] } {
     if (!this.insertValues || this.insertValues.length === 0) throw new Error('Values required for insert');
     
     const firstRow = this.insertValues[0];
     const columns = Object.keys(firstRow); // Assumes all rows have the same keys
-    let sql = `INSERT INTO ${this.fromTable} (${columns.join(', ')})`;
+    let sql = `INSERT INTO ${String(this.fromTable)} (${columns.join(', ')})`;
     const valuePlaceholders: string[] = [];
 
     for (const row of this.insertValues) {
@@ -473,63 +655,55 @@ class QueryBuilder<DB extends Database, TB extends keyof DB, SelectResult = Sele
     return { sql, params };
   }
 
-  // Internal helper to build UPDATE queries.
+  /** Builds the UPDATE part of the query */
   private buildUpdateQuery(params: any[]): { sql: string, params: any[] } {
-    if (!this.updateValues || Object.keys(this.updateValues).length === 0) throw new Error('Set values required for update');
-    
-    const columns = Object.keys(this.updateValues);
-    let sql = `UPDATE ${this.fromTable} SET `;
-    const setClauses = columns.map(column => {
-      params.push(this.updateValues![column as keyof typeof this.updateValues]); // Access value safely
-      return `${column} = ?`;
-    });
-    sql += setClauses.join(', ');
+    if (!this.updateValues || Object.keys(this.updateValues).length === 0) {
+      throw new Error('Update query must have values set using .set()');
+    }
+    if (this.whereConditions.length === 0) {
+        // Add safety net - don't allow updating without WHERE unless explicitly intended
+        // You might want a specific method like `updateAll()` for that.
+        console.warn("Executing UPDATE without a WHERE clause. This will update all rows in the table.");
+        // Or throw: throw new Error('Update query must have a WHERE clause. Use a specific method if you intend to update all rows.');
+    }
 
-    if (this.whereConditions.length > 0) { // Reuse WHERE logic from select
-       sql += ' WHERE ';
-      const whereExpressions = this.whereConditions.map(condition => {
-        if ((condition.operator === 'in' || condition.operator === 'not in') && Array.isArray(condition.value)) {
-          const placeholders = Array(condition.value.length).fill('?').join(', ');
-          params.push(...condition.value);
-          return `${condition.column} ${condition.operator} (${placeholders})`;
-        } else {
-          params.push(condition.value);
-          return `${condition.column} ${condition.operator} ?`;
-        }
-      });
-      sql += whereExpressions.join(' AND ');
+    const setClauses = Object.entries(this.updateValues)
+        .filter(([_, value]) => value !== undefined) // Filter out undefined values
+        .map(([key, value]) => {
+          params.push(value);
+          return `${key} = ?`;
+        });
+
+    if (setClauses.length === 0) {
+        throw new Error('Update query must have at least one non-undefined value in .set()');
     }
-    
-    // Append RETURNING clause if specified
-    if (this.returningColumns && this.returningColumns.length > 0) {
-        sql += ` RETURNING ${this.returningColumns.join(', ')}`;
-    }
+
+    let sql = `UPDATE ${String(this.fromTable)} SET ${setClauses.join(', ')}`;
+    sql += this.buildWhereClause(params);
+    sql += this.buildReturningClause(); // Add RETURNING
+
     return { sql, params };
   }
 
-  // Internal helper to build DELETE queries.
+  /** Builds the DELETE part of the query */
   private buildDeleteQuery(params: any[]): { sql: string, params: any[] } {
-    let sql = `DELETE FROM ${this.fromTable}`;
-    if (this.whereConditions.length > 0) { // Reuse WHERE logic
-       sql += ' WHERE ';
-      const whereExpressions = this.whereConditions.map(condition => {
-        if ((condition.operator === 'in' || condition.operator === 'not in') && Array.isArray(condition.value)) {
-          const placeholders = Array(condition.value.length).fill('?').join(', ');
-          params.push(...condition.value);
-          return `${condition.column} ${condition.operator} (${placeholders})`;
-        } else {
-          params.push(condition.value);
-          return `${condition.column} ${condition.operator} ?`;
-        }
-      });
-      sql += whereExpressions.join(' AND ');
+    if (this.whereConditions.length === 0) {
+        // Add safety net - don't allow deleting without WHERE unless explicitly intended
+         console.warn("Executing DELETE without a WHERE clause. This will delete all rows in the table.");
+        // Or throw: throw new Error('Delete query must have a WHERE clause. Use a specific method if you intend to delete all rows.');
     }
-    
-    // Append RETURNING clause if specified
-    if (this.returningColumns && this.returningColumns.length > 0) {
-        sql += ` RETURNING ${this.returningColumns.join(', ')}`;
-    }
+
+    let sql = `DELETE FROM ${String(this.fromTable)}`; // Explicit String conversion
+    sql += this.buildWhereClause(params);
+    sql += this.buildReturningClause(); // Add RETURNING
+
     return { sql, params };
+  }
+
+  /** Builds the RETURNING part of the query */
+  private buildReturningClause(): string {
+    if (!this.returningColumns || this.returningColumns.length === 0) return '';
+    return ` RETURNING ${this.returningColumns.join(', ')}`;
   }
 }
 
@@ -555,25 +729,30 @@ export class DB<DBType extends Database = Database> {
     this.transactionId = transactionId;
   }
 
-  /** Starts a SELECT query chain. */
-  selectFrom<T extends keyof DBType & string>(table: T): QueryBuilder<DBType, T> {
-    return new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
+  /** Start building a SELECT query */
+  selectFrom<T extends keyof DBType & string>(table: T): QueryBuilder<DBType, T, never> {
+    // Initial QueryBuilder state: FromTable is T, JoinedTables is never, SelectResult is Selectable<DBType[T]>
+    return new QueryBuilder<DBType, T, never>(this.client, this.transactionId, table);
   }
 
-  /** Starts an INSERT query chain. Requires `.values().execute()` or `.values().returning().execute()` to complete. */
-  insertInto<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'values' | 'returning' | 'execute'> {
-      const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
-    // Return methods for insert flow, including returning()
+  /** Start building an INSERT query */
+  // Use Pick to expose only relevant methods for insert
+  insertInto<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'values' | 'returning' | 'execute' | 'executeRaw'> {
+     // Pass the specific table 'T' to the QueryBuilder constructor
+    const qb = new QueryBuilder<DBType, T, never>(this.client, this.transactionId, table);
+    // Return a subset of methods using Pick
     return {
-        values: qb.values.bind(qb), 
-        returning: qb.returning.bind(qb),
-        execute: qb.execute.bind(qb)
-    };
+      values: qb.values.bind(qb),
+      returning: qb.returning.bind(qb),
+      execute: qb.execute.bind(qb),
+      executeRaw: qb.executeRaw.bind(qb)
+    } as Pick<QueryBuilder<DBType, T>, 'values' | 'returning' | 'execute' | 'executeRaw'>;
   }
 
-  /** Starts an UPDATE query chain. Requires `.set()` and typically `.where().execute()` or `.set().where().returning().execute()` to complete. */
-  update<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'set' | 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute'> {
-    const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
+  /** Start building an UPDATE query */
+  // Use Pick to expose only relevant methods for update
+  update<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'set' | 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute' | 'executeRaw'> {
+    const qb = new QueryBuilder<DBType, T, never>(this.client, this.transactionId, table);
     // Return methods for update flow, including returning()
     return {
         set: qb.set.bind(qb),
@@ -582,23 +761,26 @@ export class DB<DBType extends Database = Database> {
         whereIn: qb.whereIn.bind(qb),
         whereLike: qb.whereLike.bind(qb),
         returning: qb.returning.bind(qb),
-        execute: qb.execute.bind(qb)
-    };
+        execute: qb.execute.bind(qb),
+        executeRaw: qb.executeRaw.bind(qb)
+    } as Pick<QueryBuilder<DBType, T>, 'set' | 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute' | 'executeRaw'>;
   }
 
-  /** Starts a DELETE query chain. Typically requires `.where().execute()` or `.where().returning().execute()` to complete. */
-  deleteFrom<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute'> {
-    const qb = new QueryBuilder<DBType, T>(this.client, this.transactionId, table);
+  /** Start building a DELETE query */
+  // Use Pick to expose only relevant methods for delete
+  deleteFrom<T extends keyof DBType & string>(table: T): Pick<QueryBuilder<DBType, T>, 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute' | 'executeRaw'> {
+    const qb = new QueryBuilder<DBType, T, never>(this.client, this.transactionId, table);
     qb['isDeleteOperation'] = true; // Set internal flag
     // Return methods for delete flow, including returning()
-     return {
+    return {
         where: qb.where.bind(qb),
         whereEquals: qb.whereEquals.bind(qb),
         whereIn: qb.whereIn.bind(qb),
         whereLike: qb.whereLike.bind(qb),
         returning: qb.returning.bind(qb),
-        execute: qb.execute.bind(qb)
-    };
+        execute: qb.execute.bind(qb),
+        executeRaw: qb.executeRaw.bind(qb)
+    } as Pick<QueryBuilder<DBType, T>, 'where' | 'whereEquals' | 'whereIn' | 'whereLike' | 'returning' | 'execute' | 'executeRaw'>;
   }
 
   /** Executes a raw SQL query. Use with caution. */

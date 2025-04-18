@@ -1,11 +1,8 @@
 import { ORMDO, DBConfig, createDBClient } from "./queryState";
 import { adminHtml } from "./adminHtml";
-// Remove Kysely imports
-// import { ORMDODialect } from './kysely';
-// import { Kysely } from 'kysely';
 
 // Import the new DB client and types
-import { createDB, DB, Generated, ColumnType, Database as BaseDatabase } from './db'; // Import BaseDatabase
+import { createDB, DB, ColumnType, Database as BaseDatabase } from './db'; // Import BaseDatabase
 
 export { ORMDO };
 
@@ -13,6 +10,7 @@ export { ORMDO };
 // Extend BaseDatabase to satisfy constraint
 interface Database extends BaseDatabase {
   users: UserTable;
+  profiles: ProfileTable;
 }
 
 interface UserTable {
@@ -20,6 +18,13 @@ interface UserTable {
   id: string; 
   name: string;
   email: ColumnType<string | null, string, string | null>; // Allow null select/update, require string on insert
+  created_at: ColumnType<Date, string | undefined, never>; // Select as Date, insert optional string, never update
+}
+
+interface ProfileTable {
+  id: string;
+  userId: string;
+  username: string;
   created_at: ColumnType<Date, string | undefined, never>; // Select as Date, insert optional string, never update
 }
 
@@ -32,6 +37,14 @@ const dbConfig: DBConfig = {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       email TEXT UNIQUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    `,
+    `
+    CREATE TABLE IF NOT EXISTS profiles (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      username TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     `,
@@ -137,7 +150,21 @@ const handleGet = async (
         .orderBy("created_at", "desc") // Assumes created_at can be ordered directly
         .execute();
 
-      return new Response(JSON.stringify(users), {
+        // Use the new leftJoin syntax (table, leftCol, rightCol)
+        // Use qualified column names ("tableName.columnName") in subsequent methods
+        const usersWithProfiles = await db
+          .selectFrom("users")
+          // Use reversed join syntax: leftJoin(JoinTable, colFromJoinTable, colFromExisting)
+          .leftJoin("profiles", "userId", "id") // "userId" is from profiles, "id" is from users
+          // Where clause now uses qualified names
+          .where("users.id", "=", "test-id") // Example where condition using qualified name
+          // OrderBy now uses qualified names
+          .orderBy("users.created_at", "desc")
+          // Select now uses qualified names
+          .select(["users.id", "users.name", "users.email", "profiles.username"]) 
+          .execute();
+
+      return new Response(JSON.stringify(usersWithProfiles), {
         headers: corsHeaders,
       });
     } catch (error) {
